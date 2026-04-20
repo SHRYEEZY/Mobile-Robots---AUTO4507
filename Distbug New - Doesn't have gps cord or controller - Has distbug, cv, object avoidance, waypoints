@@ -1,0 +1,1223 @@
+#!/usr/bin/env python3
+# PART 1 SIMULATION - SHRIRAM NARENDRAN
+
+import math
+import csv
+import os
+from datetime import datetime
+from typing import List, Tuple, Optional
+
+import cv2
+import numpy as np
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu, LaserScan, Image
+from cv_bridge import CvBridge
+
+
+class DistBugController(Node):
+    def __init__(self):
+        super().__init__('distbug_controller')
+
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        self.odom_sub = self.create_subscription(
+            Odometry, '/odom', self.odom_callback, 10
+        )
+        self.imu_sub = self.create_subscription(
+            Imu, '/imu', self.imu_callback, 10
+        )
+        self.scan_sub = self.create_subscription(
+            LaserScan, '/scan', self.scan_callback, 10
+        )
+        self.image_sub = self.create_subscription(
+            Image, '/camera/image', self.image_callback, qos_profile_sensor_data
+        )
+
+        self.timer = self.create_timer(0.05, self.control_loop)
+
+        self.yaw = None
+        self.home_waypoint_initialized = False
+        self.start_yaw = None
+        self.home_yaw_set = False
+
+        self.odom_x = None
+        self.odom_y = None
+        self.prev_odom_x = None
+        self.prev_odom_y = None
+        self.latest_distance_increment = 0.0
+
+        self.est_x = None
+        self.est_y = None
+
+        self.scan: Optional[LaserScan] = None
+
+        self.bridge = CvBridge()
+        self.latest_image = None
+        self.latest_image_stamp = None
+
+        self.waypoints: List[Tuple[float, float, float]] = [
+            (3.0, 0.0, 0.0),
+            (3.0, 3.0, 90.0),
+            (0.0, 3.0, 0.0),
+        ]
+
+        self.current_goal_index = 0
+
+        self.state = 'GO_TO_GOAL'
+        self.finished = False
+
+        self.hit_x = None
+        self.hit_y = None
+        self.hit_yaw = None
+        self.mindist = None
+        self.moved = False
+
+        self.turn_target_yaw = None
+        self.angular_speed = 0.6
+        self.turn_correction = 3.0
+        self.yaw_tolerance = math.radians(0.9)
+        self.turn_start_time = None
+        self.turn_timeout = None
+
+        self.final_target_yaw = None
+
+        self.STEP = 3.5
+        self.SAFEDISTANCE = 0.45
+        self.MOVEAWAY = 0.9
+        self.WALL_FRONT_BLOCK = 0.60
+        self.WALLDIST = 1.0
+        self.GOALTOL = 1.0
+
+        self.goal_forward_speed = 0.40
+        self.goal_turn_gain = 1.8
+        self.max_ang = 0.8
+        self.wall_follow_speed = 0.10
+        self.min_distance_increment = 0.0005
+
+        self.map_x_min = -50.0
+        self.map_x_max = 50.0
+        self.map_y_min = -50.0
+        self.map_y_max = 50.0
+
+        self.output_dir = os.path.expanduser("~/ros2_ws")
+        self.path_log_spacing = 0.01
+        self.map_saved = False
+
+        self.start_point: Optional[Tuple[float, float]] = None
+        self.path_points: List[Tuple[float, float]] = []
+        self.path_records: List[Tuple[float, float, float, str]] = []
+        self.hit_points: List[Tuple[float, float]] = []
+        self.leave_points: List[Tuple[float, float]] = []
+        self.completed_waypoint_points: List[Tuple[float, float, float, int]] = []
+
+        # Waypoint scan state
+        self.scan_step_index = 0          # 0,1,2 for 90,180,270 deg capture points
+        self.scan_base_yaw = None
+        self.scan_detection_range = 3.0
+        self.scan_pause_cycles = 0
+        self.scan_results = []
+
+        # Marker / distance-marker tracking
+        self.current_marker_position = None
+        self.current_marker_source = None
+        self.current_waypoint_photo_path = None
+        self.marker_detection_range = 2.5
+
+        # Shape/colour settings
+        self.object_save_dir = os.path.join(self.output_dir, "object_detections")
+        os.makedirs(self.object_save_dir, exist_ok=True)
+        self.min_object_fraction = 0.01
+        self.max_object_fraction = 0.35
+        self.centre_weight = 6.0
+        self.save_debug_stages = True
+
+        self.get_logger().info('DistBug controller started')
+
+    # Utility functions
+    def wrap_angle(self, angle: float) -> float:
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    def quat_to_yaw(self, q) -> float:
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    def publish_stop(self):
+        self.cmd_pub.publish(Twist())
+
+    def check_point(self, x: float, y: float, goalx: float, goaly: float) -> bool:
+        dx = goalx - x
+        dy = goaly - y
+        distance = math.hypot(dx, dy)
+        return distance <= self.GOALTOL
+
+    def check_pointv2(self, x: float, y: float, goalx: float, goaly: float) -> bool:
+        dx = goalx - x
+        dy = goaly - y
+        distance = math.hypot(dx, dy)
+        return distance <= 0.3
+
+    def seen_before(self, x: float, y: float) -> bool:
+        for hx, hy in self.hit_points:
+            if self.check_pointv2(x, y, hx, hy):
+                return True
+        return False
+
+    def get_relative_goal_location(self, goalx: float, goaly: float) -> Tuple[float, float]:
+        dx = goalx - self.est_x
+        dy = goaly - self.est_y
+        distance = math.hypot(dx, dy)
+
+        goalB = math.atan2(dy, dx)
+        rot = self.wrap_angle(goalB - self.yaw)
+
+        return distance, rot
+
+    def reset_distbug_memory(self):
+        self.hit_x = None
+        self.hit_y = None
+        self.hit_yaw = None
+        self.mindist = None
+        self.moved = False
+
+    def reset_waypoint_scan(self):
+        self.scan_step_index = 0
+        self.scan_base_yaw = None
+        self.scan_pause_cycles = 0
+        self.scan_results = []
+
+    def record_path_point(self):
+        if self.est_x is None or self.est_y is None or self.yaw is None:
+            return
+
+        if self.start_point is None:
+            self.start_point = (self.est_x, self.est_y)
+
+        if not self.path_points:
+            self.path_points.append((self.est_x, self.est_y))
+            self.path_records.append((self.est_x, self.est_y, self.yaw, self.state))
+            return
+
+        last_x, last_y = self.path_points[-1]
+        if math.hypot(self.est_x - last_x, self.est_y - last_y) >= self.path_log_spacing:
+            self.path_points.append((self.est_x, self.est_y))
+            self.path_records.append((self.est_x, self.est_y, self.yaw, self.state))
+
+    def save_waypoint_photo(self, waypoint_index: int):
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        if self.latest_image is None:
+            self.get_logger().warn(
+                f'No camera image available to save for waypoint {waypoint_index}'
+            )
+            return None
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        image_path = os.path.join(
+            self.output_dir,
+            f"waypoint_{waypoint_index}_photo_{timestamp}.png"
+        )
+
+        success = cv2.imwrite(image_path, self.latest_image)
+
+        if success:
+            self.get_logger().info(
+                f'Saved waypoint {waypoint_index} photo: {image_path}'
+            )
+            return image_path
+        else:
+            self.get_logger().warn(
+                f'Failed to save waypoint {waypoint_index} photo'
+            )
+            return None
+
+    def save_scan_photo(self, waypoint_index: int, scan_step: int):
+        if self.latest_image is None:
+            self.get_logger().warn(
+                f'No camera image available for waypoint {waypoint_index}, scan step {scan_step}'
+            )
+            return None, None
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        raw_path = os.path.join(
+            self.object_save_dir,
+            f'wp{waypoint_index}_scan{scan_step}_{timestamp}_raw.png'
+        )
+        cv2.imwrite(raw_path, self.latest_image)
+        return self.latest_image.copy(), timestamp
+
+    def save_detection_log(self):
+        if not self.scan_results:
+            return
+
+        os.makedirs(self.output_dir, exist_ok=True)
+        csv_path = os.path.join(self.output_dir, 'distbug_object_detections.csv')
+        file_exists = os.path.exists(csv_path)
+
+        with open(csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow([
+                    'waypoint',
+                    'scan_step',
+                    'marker_x',
+                    'marker_y',
+                    'marker_source',
+                    'object_x',
+                    'object_y',
+                    'object_range_m',
+                    'object_bearing_deg',
+                    'marker_to_object_distance_m',
+                    'colour',
+                    'shape',
+                    'fraction'
+                ])
+
+            for row in self.scan_results:
+                writer.writerow([
+                    row['waypoint'],
+                    row['scan_step'],
+                    row['marker_x'],
+                    row['marker_y'],
+                    row['marker_source'],
+                    row['object_x'],
+                    row['object_y'],
+                    row['object_range_m'],
+                    row['object_bearing_deg'],
+                    row['marker_to_object_distance_m'],
+                    row['colour'],
+                    row['shape'],
+                    row['fraction']
+                ])
+
+    def save_results(self):
+        self.save_detection_log()
+
+        if self.map_saved:
+            return
+
+        self.map_saved = True
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        full_png = os.path.join(self.output_dir, f"distbug_map_FULL_{timestamp}.png")
+        zoom_png = os.path.join(self.output_dir, f"distbug_map_ZOOM_{timestamp}.png")
+        csv_path = os.path.join(self.output_dir, f"distbug_path_{timestamp}.csv")
+
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["x", "y", "yaw_rad", "state"])
+            for row in self.path_records:
+                writer.writerow(row)
+
+        def draw_map(ax):
+            if self.path_points:
+                xs = [p[0] for p in self.path_points]
+                ys = [p[1] for p in self.path_points]
+                ax.plot(xs, ys, linewidth=2.5, label="Driven path")
+
+            if self.start_point is not None:
+                ax.scatter(*self.start_point, s=100, marker='o', label="Start")
+                ax.text(*self.start_point, "  Start")
+
+            for i, (wx, wy, _) in enumerate(self.waypoints, start=1):
+                ax.scatter(wx, wy, s=100, marker='s')
+                ax.text(wx, wy + 0.2, f"  WP{i}")
+
+            if self.hit_points:
+                hx = [p[0] for p in self.hit_points]
+                hy = [p[1] for p in self.hit_points]
+                ax.scatter(hx, hy, s=80, marker='x', label="Hits")
+                for i, (x, y) in enumerate(self.hit_points, start=1):
+                    ax.text(x, y, f"  H{i}")
+
+            if self.leave_points:
+                lx = [p[0] for p in self.leave_points]
+                ly = [p[1] for p in self.leave_points]
+                ax.scatter(lx, ly, s=80, marker='^', label="Leaves")
+                for i, (x, y) in enumerate(self.leave_points, start=1):
+                    ax.text(x, y, f"  L{i}")
+
+            for x, y, yaw, idx in self.completed_waypoint_points:
+                dx = 0.3 * math.cos(yaw)
+                dy = 0.3 * math.sin(yaw)
+                ax.arrow(
+                    x, y, dx, dy,
+                    head_width=0.1,
+                    head_length=0.1,
+                    length_includes_head=True
+                )
+
+            ax.grid(True)
+            ax.set_xlabel("X (m)")
+            ax.set_ylabel("Y (m)")
+            ax.set_aspect('equal')
+
+        fig1, ax1 = plt.subplots(figsize=(10, 10))
+        draw_map(ax1)
+
+        ax1.set_xlim(self.map_x_min, self.map_x_max)
+        ax1.set_ylim(self.map_y_min, self.map_y_max)
+        ax1.set_title("PIONEER VOYAGE (Full World)")
+        ax1.legend()
+
+        plt.tight_layout()
+        plt.savefig(full_png, dpi=350)
+        plt.close(fig1)
+
+        fig2, ax2 = plt.subplots(figsize=(10, 10))
+        draw_map(ax2)
+
+        xs, ys = [], []
+
+        if self.path_points:
+            xs += [p[0] for p in self.path_points]
+            ys += [p[1] for p in self.path_points]
+
+        if self.start_point:
+            xs.append(self.start_point[0])
+            ys.append(self.start_point[1])
+
+        for (wx, wy, _) in self.waypoints:
+            xs.append(wx)
+            ys.append(wy)
+
+        for p in self.hit_points:
+            xs.append(p[0])
+            ys.append(p[1])
+
+        for p in self.leave_points:
+            xs.append(p[0])
+            ys.append(p[1])
+
+        for x, y, _, _ in self.completed_waypoint_points:
+            xs.append(x)
+            ys.append(y)
+
+        if xs and ys:
+            padding = 0.5
+            ax2.set_xlim(min(xs) - padding, max(xs) + padding)
+            ax2.set_ylim(min(ys) - padding, max(ys) + padding)
+
+        ax2.set_title("PIONEER VOYAGE (Zoomed View)")
+        ax2.legend()
+
+        plt.tight_layout()
+        plt.savefig(zoom_png, dpi=400)
+        plt.close(fig2)
+
+        self.get_logger().info(f"Saved FULL map: {full_png}")
+        self.get_logger().info(f"Saved ZOOM map: {zoom_png}")
+        self.get_logger().info(f"Saved CSV: {csv_path}")
+
+    # Sensor callbacks
+    def odom_callback(self, msg: Odometry):
+        self.odom_x = msg.pose.pose.position.x
+        self.odom_y = msg.pose.pose.position.y
+
+        if self.prev_odom_x is None or self.prev_odom_y is None:
+            self.prev_odom_x = self.odom_x
+            self.prev_odom_y = self.odom_y
+
+            if self.est_x is None or self.est_y is None:
+                self.est_x = self.odom_x
+                self.est_y = self.odom_y
+                self.start_point = (self.est_x, self.est_y)
+                
+                if len(self.waypoints) > 0 and not self.home_waypoint_initialized:
+                    self.waypoints.append((self.start_point[0], self.start_point[1], 0.0))
+                    self.home_waypoint_initialized = True
+                return
+
+        dx = self.odom_x - self.prev_odom_x
+        dy = self.odom_y - self.prev_odom_y
+        dist_inc = math.hypot(dx, dy)
+        self.latest_distance_increment += dist_inc
+
+        self.prev_odom_x = self.odom_x
+        self.prev_odom_y = self.odom_y
+
+    def imu_callback(self, msg: Imu):
+        self.yaw = self.quat_to_yaw(msg.orientation)
+
+        if self.start_yaw is None:
+            self.start_yaw = self.yaw
+            self.get_logger().info(
+                f'Start yaw captured: {math.degrees(self.start_yaw):.2f} deg'
+            )
+
+        if (
+            self.start_point is not None
+            and self.home_waypoint_initialized
+            and not self.home_yaw_set
+            and len(self.waypoints) > 0
+        ):
+            self.waypoints[-1] = (
+                self.start_point[0],
+                self.start_point[1],
+                math.degrees(self.start_yaw)
+            )
+            self.home_yaw_set = True
+
+            self.get_logger().info(
+                f'Home waypoint yaw set to {math.degrees(self.start_yaw):.2f} deg'
+            )
+
+    def scan_callback(self, msg: LaserScan):
+        self.scan = msg
+
+    def image_callback(self, msg: Image):
+        try:
+            self.latest_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            self.latest_image_stamp = msg.header.stamp
+        except Exception as e:
+            self.get_logger().warn(f'Failed to convert image: {e}')
+
+    # Pose estimation
+    def consume_forward_increment(self):
+        dist_inc = self.latest_distance_increment
+        if dist_inc > self.min_distance_increment:
+            self.est_x += dist_inc * math.cos(self.yaw)
+            self.est_y += dist_inc * math.sin(self.yaw)
+        self.latest_distance_increment = 0.0
+
+    # LaserScan helpers
+    def get_range_at_bearing(self, bearing_rad: float) -> float:
+        if self.scan is None:
+            return 0.0
+
+        if bearing_rad < self.scan.angle_min or bearing_rad > self.scan.angle_max:
+            return self.scan.range_max
+
+        idx = int((bearing_rad - self.scan.angle_min) / self.scan.angle_increment)
+        idx = max(0, min(idx, len(self.scan.ranges) - 1))
+
+        r = self.scan.ranges[idx]
+        if math.isinf(r) or math.isnan(r):
+            return self.scan.range_max
+        return r
+
+    def min_range_in_window(self, center_rad: float, half_width_rad: float) -> float:
+        if self.scan is None:
+            return 0.0
+
+        rmin = self.scan.range_max
+        angle = center_rad - half_width_rad
+        end = center_rad + half_width_rad
+
+        while angle <= end:
+            r = self.get_range_at_bearing(angle)
+            rmin = min(rmin, r)
+            angle += self.scan.angle_increment * 3.0
+
+        return rmin
+
+    def min_range_and_bearing_in_window(self, center_rad: float, half_width_rad: float) -> Tuple[float, float]:
+        if self.scan is None:
+            return self.scan_detection_range + 1.0, center_rad
+
+        best_r = self.scan.range_max
+        best_angle = center_rad
+
+        angle = center_rad - half_width_rad
+        end = center_rad + half_width_rad
+
+        while angle <= end:
+            r = self.get_range_at_bearing(angle)
+            if r < best_r:
+                best_r = r
+                best_angle = angle
+            angle += self.scan.angle_increment * 3.0
+
+        return best_r, best_angle
+
+    def front_distance(self) -> float:
+        return self.min_range_in_window(0.0, math.radians(60.0))
+
+    def range_bearing_to_global(self, range_m: float, bearing_rad: float) -> Tuple[float, float]:
+        global_angle = self.yaw + bearing_rad
+        x = self.est_x + range_m * math.cos(global_angle)
+        y = self.est_y + range_m * math.sin(global_angle)
+        return x, y
+
+    def estimate_marker_position(self, fallback_goalx: float, fallback_goaly: float):
+        marker_range, marker_bearing = self.min_range_and_bearing_in_window(
+            0.0, math.radians(20.0)
+        )
+
+        if marker_range < self.marker_detection_range:
+            mx, my = self.range_bearing_to_global(marker_range, marker_bearing)
+            self.current_marker_position = (mx, my)
+            self.current_marker_source = 'lidar'
+            self.get_logger().info(
+                f'Marker found by lidar at ({mx:.3f}, {my:.3f}), '
+                f'range={marker_range:.3f}m, bearing={math.degrees(marker_bearing):.1f}deg'
+            )
+        else:
+            self.current_marker_position = (fallback_goalx, fallback_goaly)
+            self.current_marker_source = 'waypoint_fallback'
+            self.get_logger().info(
+                f'Marker not found in front lidar window. '
+                f'Using waypoint coordinates ({fallback_goalx:.3f}, {fallback_goaly:.3f})'
+            )
+
+    # Turn helpers
+    def start_turn_relative(self, delta_rad: float):
+        self.turn_target_yaw = self.wrap_angle(self.yaw + delta_rad)
+        self.turn_start_time = self.get_clock().now().nanoseconds / 1e9
+
+        yaw_error = self.wrap_angle(self.turn_target_yaw - self.yaw)
+        ideal_time = abs(yaw_error) / self.angular_speed if self.angular_speed > 0.0 else 0.0
+        self.turn_timeout = ideal_time * self.turn_correction
+
+    def start_turn_absolute(self, target_yaw_rad: float):
+        self.turn_target_yaw = self.wrap_angle(target_yaw_rad)
+        self.turn_start_time = self.get_clock().now().nanoseconds / 1e9
+
+        yaw_error = self.wrap_angle(self.turn_target_yaw - self.yaw)
+        ideal_time = abs(yaw_error) / self.angular_speed if self.angular_speed > 0.0 else 0.0
+        self.turn_timeout = ideal_time * self.turn_correction
+
+    def perform_turn_step(self) -> bool:
+        yaw_error = self.wrap_angle(self.turn_target_yaw - self.yaw)
+        now = self.get_clock().now().nanoseconds / 1e9
+        elapsed = now - self.turn_start_time
+
+        if abs(yaw_error) < self.yaw_tolerance:
+            self.publish_stop()
+            return True
+
+        if elapsed > self.turn_timeout:
+            self.publish_stop()
+            self.get_logger().warn('Turn stopped by timeout safety')
+            return True
+
+        twist = Twist()
+        twist.linear.x = 0.0
+        twist.angular.z = self.angular_speed if yaw_error > 0.0 else -self.angular_speed
+        self.cmd_pub.publish(twist)
+        return False
+
+    # Object shape / colour pipeline
+    def save_stage(self, timestamp, label, image):
+        path = os.path.join(self.object_save_dir, f'{timestamp}_{label}.png')
+        cv2.imwrite(path, image)
+
+    def classify_colour(self, bgr_img, contour):
+        mask = np.zeros(bgr_img.shape[:2], dtype=np.uint8)
+        cv2.drawContours(mask, [contour], -1, 255, thickness=-1)
+
+        hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
+
+        colour_ranges = {
+            'red': [
+                (np.array([0, 80, 50]), np.array([10, 255, 255])),
+                (np.array([160, 80, 50]), np.array([179, 255, 255]))
+            ],
+            'orange': [
+                (np.array([10, 80, 50]), np.array([22, 255, 255]))
+            ],
+            'yellow': [
+                (np.array([22, 80, 50]), np.array([35, 255, 255]))
+            ],
+            'green': [
+                (np.array([35, 60, 50]), np.array([85, 255, 255]))
+            ],
+            'blue': [
+                (np.array([90, 60, 50]), np.array([130, 255, 255]))
+            ],
+            'purple': [
+                (np.array([130, 60, 50]), np.array([160, 255, 255]))
+            ],
+            'white': [
+                (np.array([0, 0, 170]), np.array([179, 55, 255]))
+            ],
+            'black': [
+                (np.array([0, 0, 0]), np.array([179, 255, 40]))
+            ]
+        }
+
+        best_colour = 'unknown'
+        best_count = 0
+
+        for colour_name, ranges in colour_ranges.items():
+            total_mask = np.zeros(mask.shape, dtype=np.uint8)
+
+            for lower, upper in ranges:
+                colour_mask = cv2.inRange(hsv, lower, upper)
+                total_mask = cv2.bitwise_or(total_mask, colour_mask)
+
+            overlap = cv2.bitwise_and(total_mask, mask)
+            count = cv2.countNonZero(overlap)
+
+            if count > best_count:
+                best_count = count
+                best_colour = colour_name
+
+        return best_colour
+
+    def classify_shape_advanced(self, contour):
+        peri = cv2.arcLength(contour, True)
+        area = cv2.contourArea(contour)
+
+        if peri == 0 or area == 0:
+            return 'unknown'
+
+        approx = cv2.approxPolyDP(contour, 0.03 * peri, True)
+        vertices = len(approx)
+
+        hull = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+        solidity = area / hull_area if hull_area > 0 else 0.0
+
+        x, y, w, h = cv2.boundingRect(approx)
+        aspect_ratio = float(w) / float(h) if h > 0 else 0.0
+
+        circularity = 4.0 * math.pi * area / (peri * peri)
+
+        if vertices == 3:
+            return 'triangle'
+
+        if vertices == 4:
+            if 0.9 <= aspect_ratio <= 1.1:
+                return 'square'
+            if solidity < 0.95:
+                return 'trapezium_like'
+            return 'rectangle'
+
+        if vertices == 5:
+            return 'pentagon'
+
+        if vertices == 6:
+            return 'hexagon'
+
+        if circularity > 0.80:
+            return 'circle'
+
+        if 0.55 < circularity <= 0.80:
+            return 'ellipse_like'
+
+        if vertices >= 7 and solidity > 0.90:
+            return 'round_irregular'
+
+        return 'irregular'
+
+    def process_frame_for_object(self, frame, timestamp):
+        h, w = frame.shape[:2]
+        image_area = float(h * w)
+
+        if self.save_debug_stages:
+            self.save_stage(timestamp, '01_raw', frame)
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        green_mask = cv2.inRange(
+            hsv,
+            np.array([35, 50, 40], dtype=np.uint8),
+            np.array([90, 255, 255], dtype=np.uint8)
+        )
+        if self.save_debug_stages:
+            self.save_stage(timestamp, '02_green_mask', green_mask)
+
+        white_mask = cv2.inRange(
+            hsv,
+            np.array([0, 0, 170], dtype=np.uint8),
+            np.array([179, 55, 255], dtype=np.uint8)
+        )
+        if self.save_debug_stages:
+            self.save_stage(timestamp, '03_white_mask', white_mask)
+
+        background_mask = cv2.bitwise_or(green_mask, white_mask)
+        if self.save_debug_stages:
+            self.save_stage(timestamp, '04_background_mask', background_mask)
+
+        foreground_mask = cv2.bitwise_not(background_mask)
+
+        kernel = np.ones((5, 5), np.uint8)
+        foreground_mask = cv2.morphologyEx(foreground_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        foreground_mask = cv2.morphologyEx(foreground_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        if self.save_debug_stages:
+            self.save_stage(timestamp, '05_foreground_mask', foreground_mask)
+
+        contours, _ = cv2.findContours(
+            foreground_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        if not contours:
+            return None
+
+        candidates = []
+        cx_img = w / 2.0
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area <= 0:
+                continue
+
+            fraction = area / image_area
+            if fraction < self.min_object_fraction:
+                continue
+            if fraction > self.max_object_fraction:
+                continue
+
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            if cw < 15 or ch < 15:
+                continue
+
+            cx = x + cw / 2.0
+            score = area - self.centre_weight * abs(cx - cx_img)
+
+            candidates.append((cnt, area, fraction, score))
+
+        if not candidates:
+            return None
+
+        best_contour, _, best_fraction, _ = max(candidates, key=lambda item: item[3])
+
+        object_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        cv2.drawContours(object_mask, [best_contour], -1, 255, thickness=-1)
+        if self.save_debug_stages:
+            self.save_stage(timestamp, '06_object_mask', object_mask)
+
+        filtered_img = cv2.bitwise_and(frame, frame, mask=object_mask)
+        if self.save_debug_stages:
+            self.save_stage(timestamp, '07_filtered_object', filtered_img)
+
+        colour = self.classify_colour(frame, best_contour)
+        shape = self.classify_shape_advanced(best_contour)
+
+        annotated = frame.copy()
+        x, y, cw, ch = cv2.boundingRect(best_contour)
+
+        moments = cv2.moments(best_contour)
+        if moments['m00'] != 0:
+            cx = int(moments['m10'] / moments['m00'])
+            cy = int(moments['m01'] / moments['m00'])
+        else:
+            cx = x + cw // 2
+            cy = y + ch // 2
+
+        cv2.drawContours(annotated, [best_contour], -1, (0, 255, 0), 2)
+        cv2.rectangle(annotated, (x, y), (x + cw, y + ch), (255, 255, 0), 2)
+        cv2.circle(annotated, (cx, cy), 5, (0, 0, 255), -1)
+
+        label = f'{colour} {shape} ({best_fraction*100:.1f}%)'
+        cv2.putText(
+            annotated,
+            label,
+            (x, max(y - 10, 25)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA
+        )
+
+        self.save_stage(timestamp, '08_annotated', annotated)
+
+        return {
+            'annotated': annotated,
+            'colour': colour,
+            'shape': shape,
+            'fraction': best_fraction
+        }
+
+    def evaluate_current_scan_view(self):
+        waypoint_idx = self.current_goal_index + 1
+        scan_step = self.scan_step_index + 1
+
+        obj_range, obj_bearing = self.min_range_and_bearing_in_window(
+            0.0, math.radians(35.0)
+        )
+
+        self.get_logger().info(
+            f'WAYPOINT_SCAN: wp={waypoint_idx}, step={scan_step}, '
+            f'front_obj_range={obj_range:.3f}m, bearing={math.degrees(obj_bearing):.1f}deg'
+        )
+
+        if obj_range >= self.scan_detection_range:
+            self.get_logger().info(
+                f'No object within {self.scan_detection_range:.1f}m at scan step {scan_step}'
+            )
+            return
+
+        frame, timestamp = self.save_scan_photo(waypoint_idx, scan_step)
+        if frame is None:
+            return
+
+        result = self.process_frame_for_object(frame, f'wp{waypoint_idx}_scan{scan_step}_{timestamp}')
+
+        if result is None:
+            self.get_logger().info(
+                f'Object within lidar range at wp{waypoint_idx}, step {scan_step}, '
+                f'but no valid visual object found.'
+            )
+            return
+
+        obj_x, obj_y = self.range_bearing_to_global(obj_range, obj_bearing)
+
+        if self.current_marker_position is None:
+            self.get_logger().warn(
+                'Marker position missing during object evaluation. Falling back to waypoint coordinates.'
+            )
+            goalx, goaly, _ = self.waypoints[self.current_goal_index]
+            self.current_marker_position = (goalx, goaly)
+            self.current_marker_source = 'late_waypoint_fallback'
+
+        marker_x, marker_y = self.current_marker_position
+        marker_to_object_distance = math.hypot(obj_x - marker_x, obj_y - marker_y)
+
+        annotated_path = os.path.join(
+            self.object_save_dir,
+            f'wp{waypoint_idx}_scan{scan_step}_{timestamp}_annotated_final.png'
+        )
+        cv2.imwrite(annotated_path, result['annotated'])
+
+        self.scan_results.append({
+            'waypoint': waypoint_idx,
+            'scan_step': scan_step,
+            'marker_x': marker_x,
+            'marker_y': marker_y,
+            'marker_source': self.current_marker_source,
+            'object_x': obj_x,
+            'object_y': obj_y,
+            'object_range_m': obj_range,
+            'object_bearing_deg': math.degrees(obj_bearing),
+            'marker_to_object_distance_m': marker_to_object_distance,
+            'colour': result['colour'],
+            'shape': result['shape'],
+            'fraction': result['fraction']
+        })
+
+        self.get_logger().info(
+            f'DETECTED at wp{waypoint_idx}, scan {scan_step}: '
+            f'colour={result["colour"]}, shape={result["shape"]}, '
+            f'obj_pos=({obj_x:.3f},{obj_y:.3f}), '
+            f'marker_pos=({marker_x:.3f},{marker_y:.3f}), '
+            f'marker_to_object_distance={marker_to_object_distance:.3f}m, '
+            f'marker_source={self.current_marker_source}'
+        )
+
+    # Main DistBug logic
+    def go_to_goal_step(self, goalx: float, goaly: float):
+        self.consume_forward_increment()
+
+        if self.check_point(self.est_x, self.est_y, goalx, goaly):
+            self.publish_stop()
+
+            _, _, final_yaw_deg = self.waypoints[self.current_goal_index]
+            self.final_target_yaw = math.radians(final_yaw_deg)
+            self.start_turn_absolute(self.final_target_yaw)
+            self.state = 'FINAL_ALIGN'
+
+            self.get_logger().info(
+                f'POSITION of waypoint {self.current_goal_index + 1}/{len(self.waypoints)} reached '
+                f'at ({self.est_x:.3f}, {self.est_y:.3f}), now aligning yaw'
+            )
+            return
+
+        distance, rot = self.get_relative_goal_location(goalx, goaly)
+        freespacetogoal = self.get_range_at_bearing(rot)
+        front = self.front_distance()
+
+        self.get_logger().info(
+            f'GO_TO_GOAL: wp={self.current_goal_index + 1}/{len(self.waypoints)} '
+            f'est=({self.est_x:.3f},{self.est_y:.3f}) '
+            f'd={distance:.3f} rot={math.degrees(rot):.2f}deg '
+            f'front={front:.3f} F={freespacetogoal:.3f}'
+        )
+
+        if front < self.SAFEDISTANCE or freespacetogoal < self.SAFEDISTANCE:
+            self.hit_x = self.est_x
+            self.hit_y = self.est_y
+            self.hit_yaw = self.yaw
+            self.mindist = distance
+            self.moved = False
+
+            if not self.seen_before(self.est_x, self.est_y):
+                self.hit_points.append((self.est_x, self.est_y))
+                self.get_logger().info(
+                    f'ADDED HIT POINT at ({self.est_x:.3f}, {self.est_y:.3f})'
+                )
+
+            self.publish_stop()
+            self.start_turn_relative(-math.pi / 2.5)
+            self.state = 'INIT_TURN_AFTER_HIT'
+
+            self.get_logger().info(
+                f'HIT: hit=({self.hit_x:.3f},{self.hit_y:.3f}) '
+                f'mindist={self.mindist:.3f}'
+            )
+            return
+
+        twist = Twist()
+        if rot > math.radians(10.0):
+            twist.linear.x = 0.05
+            twist.angular.z = min(self.max_ang, self.goal_turn_gain * rot)
+        elif rot < math.radians(-10.0):
+            twist.linear.x = 0.05
+            twist.angular.z = max(-self.max_ang, self.goal_turn_gain * rot)
+        else:
+            twist.linear.x = self.goal_forward_speed
+            twist.angular.z = 0.0
+
+        self.cmd_pub.publish(twist)
+
+    def init_turn_after_hit_step(self):
+        done = self.perform_turn_step()
+        if done:
+            self.state = 'BOUNDARY_FOLLOW'
+            self.turn_target_yaw = None
+            self.turn_start_time = None
+            self.turn_timeout = None
+            self.get_logger().info('Completed 60deg hit turn. Entering BOUNDARY_FOLLOW.')
+
+    def boundary_follow_step(self, goalx: float, goaly: float):
+        self.consume_forward_increment()
+
+        if self.check_point(self.est_x, self.est_y, goalx, goaly):
+            self.publish_stop()
+
+            _, _, final_yaw_deg = self.waypoints[self.current_goal_index]
+            self.final_target_yaw = math.radians(final_yaw_deg)
+            self.start_turn_absolute(self.final_target_yaw)
+            self.state = 'FINAL_ALIGN'
+
+            self.get_logger().info(
+                f'POSITION of waypoint {self.current_goal_index + 1}/{len(self.waypoints)} reached '
+                f'at ({self.est_x:.3f}, {self.est_y:.3f}) from boundary follow, now aligning yaw'
+            )
+            return
+
+        sqr = math.hypot(self.hit_x - self.est_x, self.hit_y - self.est_y)
+        if sqr > self.MOVEAWAY:
+            self.moved = True
+
+        if self.moved and self.seen_before(self.est_x, self.est_y):
+            if not self.check_point(self.est_x, self.est_y, self.hit_x, self.hit_y):
+                self.publish_stop()
+                self.finished = True
+                self.get_logger().warn('GOAL UNREACHABLE: revisited a previous hit point.')
+                self.save_results()
+                return
+
+        distance, angle = self.get_relative_goal_location(goalx, goaly)
+
+        if distance < self.mindist:
+            self.mindist = distance
+
+        freespacetogoal = self.get_range_at_bearing(angle)
+        front = self.front_distance()
+        left = self.get_range_at_bearing(1.571)
+
+        self.get_logger().info(
+            f'BOUNDARY: wp={self.current_goal_index + 1}/{len(self.waypoints)} '
+            f'd={distance:.3f} F={freespacetogoal:.3f} '
+            f'min={self.mindist:.3f} left={left:.3f} front={front:.3f} '
+            f'bearing={angle:.2f} '
+            f'expr={distance - freespacetogoal:.3f} <= {self.mindist - self.STEP:.3f}'
+        )
+
+        if self.moved and distance - freespacetogoal <= self.mindist - self.STEP:
+            self.publish_stop()
+            self.leave_points.append((self.est_x, self.est_y))
+            self.state = 'GO_TO_GOAL'
+            self.get_logger().info(
+                f'LEAVE boundary and resume goal-seeking '
+                f'(left={left:.3f}, F={freespacetogoal:.3f})'
+            )
+            return
+
+        twist = Twist()
+
+        if front < self.WALL_FRONT_BLOCK:
+            twist.linear.x = 0.0
+            twist.angular.z = -self.max_ang
+            self.cmd_pub.publish(twist)
+            return
+
+        err = left - self.WALLDIST
+
+        if err > 0.20:
+            twist.linear.x = 0.10
+            twist.angular.z = 0.6
+        elif err > 0.01:
+            twist.linear.x = 0.10
+            twist.angular.z = 0.15
+        elif err < -0.05:
+            twist.linear.x = 0.10
+            twist.angular.z = -0.6
+        elif err < -0.005:
+            twist.linear.x = 0.10
+            twist.angular.z = -0.15
+        else:
+            twist.linear.x = 0.10
+            twist.angular.z = 0.0
+
+        self.cmd_pub.publish(twist)
+
+    def final_align_step(self):
+        done = self.perform_turn_step()
+        if done:
+            self.publish_stop()
+
+            self.completed_waypoint_points.append(
+                (self.est_x, self.est_y, self.yaw, self.current_goal_index + 1)
+            )
+
+            waypoint_idx = self.current_goal_index + 1
+            goalx, goaly, _ = self.waypoints[self.current_goal_index]
+
+            self.get_logger().info(
+                f'Waypoint {waypoint_idx}/{len(self.waypoints)} fully completed at '
+                f'({self.est_x:.3f}, {self.est_y:.3f}), '
+                f'yaw={math.degrees(self.yaw):.2f} deg'
+            )
+
+            self.turn_target_yaw = None
+            self.turn_start_time = None
+            self.turn_timeout = None
+            self.final_target_yaw = None
+
+            # Take waypoint photo first
+            self.current_waypoint_photo_path = self.save_waypoint_photo(waypoint_idx)
+
+            # Estimate marker location using front lidar, otherwise fallback to waypoint location
+            self.estimate_marker_position(goalx, goaly)
+
+            self.scan_base_yaw = self.yaw
+            self.scan_step_index = 0
+            self.state = 'WAYPOINT_SCAN_TURN'
+
+            self.get_logger().info(
+                f'Starting 360 waypoint scan for waypoint {waypoint_idx}'
+            )
+
+    def waypoint_scan_turn_step(self):
+        if self.scan_step_index >= 3:
+            self.save_detection_log()
+
+            self.reset_distbug_memory()
+            self.reset_waypoint_scan()
+
+            self.current_marker_position = None
+            self.current_marker_source = None
+            self.current_waypoint_photo_path = None
+
+            self.current_goal_index += 1
+
+            if self.current_goal_index >= len(self.waypoints):
+                self.finished = True
+                self.publish_stop()
+                self.get_logger().info('All waypoints completed')
+                self.save_results()
+            else:
+                self.state = 'GO_TO_GOAL'
+            return
+
+        target = self.wrap_angle(
+            self.scan_base_yaw + (self.scan_step_index + 1) * (math.pi / 2.0)
+        )
+
+        if self.turn_target_yaw is None:
+            self.start_turn_absolute(target)
+
+        done = self.perform_turn_step()
+        if done:
+            self.publish_stop()
+            self.turn_target_yaw = None
+            self.turn_start_time = None
+            self.turn_timeout = None
+            self.scan_pause_cycles = 4
+            self.state = 'WAYPOINT_SCAN_EVALUATE'
+
+    def waypoint_scan_evaluate_step(self):
+        self.publish_stop()
+
+        if self.scan_pause_cycles > 0:
+            self.scan_pause_cycles -= 1
+            return
+
+        self.evaluate_current_scan_view()
+        self.scan_step_index += 1
+        self.state = 'WAYPOINT_SCAN_TURN'
+
+    # Main control loop
+    def control_loop(self):
+        if self.finished:
+            self.publish_stop()
+            return
+
+        if self.est_x is None or self.est_y is None or self.yaw is None or self.scan is None:
+            return
+
+        self.record_path_point()
+
+        if self.current_goal_index >= len(self.waypoints):
+            self.finished = True
+            self.publish_stop()
+            self.get_logger().info('All waypoints completed')
+            self.save_results()
+            return
+
+        goalx, goaly, _ = self.waypoints[self.current_goal_index]
+
+        if self.state == 'GO_TO_GOAL':
+            self.go_to_goal_step(goalx, goaly)
+            return
+
+        if self.state == 'INIT_TURN_AFTER_HIT':
+            self.init_turn_after_hit_step()
+            return
+
+        if self.state == 'BOUNDARY_FOLLOW':
+            self.boundary_follow_step(goalx, goaly)
+            return
+
+        if self.state == 'FINAL_ALIGN':
+            self.final_align_step()
+            return
+
+        if self.state == 'WAYPOINT_SCAN_TURN':
+            self.waypoint_scan_turn_step()
+            return
+
+        if self.state == 'WAYPOINT_SCAN_EVALUATE':
+            self.waypoint_scan_evaluate_step()
+            return
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DistBugController()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+
+    node.publish_stop()
+    node.save_results()
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
