@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+import math
+from typing import Optional
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Joy
+from std_msgs.msg import String
+
+class DualShockModeTeleop(Node):
+   """
+   DualShock teleop + mode selector for Pioneer.
+   Modes:
+     - MANUAL: joystick drives robot, only while manual deadman is held
+     - AUTO: passes through /nav_cmd_vel, only while auto deadman is held
+   Expected controls (adjust indices after checking /joy on your setup):
+     - X button       -> AUTO mode
+     - O button       -> MANUAL mode
+     - L2             -> manual deadman
+     - R2             -> auto deadman
+     - Left stick X   -> angular z
+     - Right stick Y  -> linear x
+   Notes:
+     - Right stick Y is usually inverted on many controllers, so we negate it.
+     - If deadman not pressed, node publishes zero Twist.
+     - If in AUTO mode but no nav command has arrived, node publishes zero Twist.
+   """
+   MODE_MANUAL = "manual"
+   MODE_AUTO = "auto"
+   def __init__(self) -> None:
+       super().__init__("dualshock_mode_teleop")
+       # ---------------- Parameters ----------------
+       self.declare_parameter("cmd_vel_topic", "/cmd_vel")
+       self.declare_parameter("joy_topic", "/joy")
+       self.declare_parameter("nav_cmd_vel_topic", "/nav_cmd_vel")
+       self.declare_parameter("mode_topic", "/control_mode")
+       self.declare_parameter("max_linear", 0.50)
+       self.declare_parameter("max_angular", 2.00)
+       self.declare_parameter("deadzone", 0.10)
+       self.declare_parameter("publish_rate_hz", 20.0)
+       # Button/axis mapping
+       # These are COMMON defaults for many Linux/ROS joystick layouts,
+       # but you MUST verify using: ros2 topic echo /joy
+       self.declare_parameter("btn_x", 0)              # X
+       self.declare_parameter("btn_circle", 1)         # O
+       self.declare_parameter("axis_left_x", 0)        # left stick left/right
+       self.declare_parameter("axis_right_y", 3)       # right stick up/down
+       self.declare_parameter("axis_l2", 4)            # L2 trigger axis
+       self.declare_parameter("axis_r2", 5)            # R2 trigger axis
+       self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
+       self.joy_topic = self.get_parameter("joy_topic").value
+       self.nav_cmd_vel_topic = self.get_parameter("nav_cmd_vel_topic").value
+       self.mode_topic = self.get_parameter("mode_topic").value
+       self.max_linear = float(self.get_parameter("max_linear").value)
+       self.max_angular = float(self.get_parameter("max_angular").value)
+       self.deadzone = float(self.get_parameter("deadzone").value)
+       self.publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
+       self.btn_x = int(self.get_parameter("btn_x").value)
+       self.btn_circle = int(self.get_parameter("btn_circle").value)
+       self.axis_left_x = int(self.get_parameter("axis_left_x").value)
+       self.axis_right_y = int(self.get_parameter("axis_right_y").value)
+       self.axis_l2 = int(self.get_parameter("axis_l2").value)
+       self.axis_r2 = int(self.get_parameter("axis_r2").value)
+       # ---------------- State ----------------
+       self.mode = self.MODE_MANUAL
+       self.last_nav_cmd: Optional[Twist] = None
+       self.last_joy: Optional[Joy] = None
+       # ---------------- ROS interfaces ----------------
+       self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+       self.mode_pub = self.create_publisher(String, self.mode_topic, 10)
+       self.joy_sub = self.create_subscription(
+           Joy,
+           self.joy_topic,
+           self.joy_callback,
+           10
+       )
+       self.nav_sub = self.create_subscription(
+           Twist,
+           self.nav_cmd_vel_topic,
+           self.nav_cmd_callback,
+           10
+       )
+       timer_period = 1.0 / self.publish_rate_hz
+       self.timer = self.create_timer(timer_period, self.control_loop)
+       self.get_logger().info("DualShock teleop node started.")
+       self.get_logger().info("Default mode: MANUAL")
+   # ---------------- Utility functions ----------------
+   def apply_deadzone(self, value: float) -> float:
+       if abs(value) < self.deadzone:
+           return 0.0
+       return value
+   def axis_pressed(self, joy: Joy, axis_index: int, threshold: float = 0.5) -> bool:
+       """
+       Trigger handling:
+       On many controllers, triggers rest at +1 and move toward -1 when pressed.
+       This function treats "pressed" as axis value below threshold-ish.
+       You may need to invert/change this after checking /joy.
+       """
+       if axis_index >= len(joy.axes):
+           return False
+       return joy.axes[axis_index] < threshold
+   def button_pressed(self, joy: Joy, button_index: int) -> bool:
+       if button_index >= len(joy.buttons):
+           return False
+       return joy.buttons[button_index] == 1
+   def zero_twist(self) -> Twist:
+       msg = Twist()
+       msg.linear.x = 0.0
+       msg.angular.z = 0.0
+       return msg
+   # ---------------- Callbacks ----------------
+   def joy_callback(self, msg: Joy) -> None:
+       self.last_joy = msg
+       if self.button_pressed(msg, self.btn_circle):
+           if self.mode != self.MODE_MANUAL:
+               self.mode = self.MODE_MANUAL
+               self.get_logger().info("Switched to MANUAL mode")
+               self.publish_mode()
+       if self.button_pressed(msg, self.btn_x):
+           if self.mode != self.MODE_AUTO:
+               self.mode = self.MODE_AUTO
+               self.get_logger().info("Switched to AUTO mode")
+               self.publish_mode()
+   def nav_cmd_callback(self, msg: Twist) -> None:
+       self.last_nav_cmd = msg
+   def publish_mode(self) -> None:
+       mode_msg = String()
+       mode_msg.data = self.mode
+       self.mode_pub.publish(mode_msg)
+   # ---------------- Main control loop ----------------
+   def control_loop(self) -> None:
+       if self.last_joy is None:
+           self.cmd_pub.publish(self.zero_twist())
+           return
+       joy = self.last_joy
+       if self.mode == self.MODE_MANUAL:
+           manual_deadman = self.axis_pressed(joy, self.axis_l2)
+           if not manual_deadman:
+               self.cmd_pub.publish(self.zero_twist())
+               return
+           linear_input = 0.0
+           angular_input = 0.0
+           if self.axis_right_y < len(joy.axes):
+               # Commonly pushing stick forward gives negative axis value
+               linear_input = joy.axes[self.axis_right_y]
+           if self.axis_left_x < len(joy.axes):
+               angular_input = joy.axes[self.axis_left_x]
+           linear_input = self.apply_deadzone(linear_input)
+           angular_input = self.apply_deadzone(angular_input)
+           cmd = Twist()
+           cmd.linear.x = self.max_linear * linear_input
+           cmd.angular.z = self.max_angular * angular_input
+           self.cmd_pub.publish(cmd)
+           return
+       if self.mode == self.MODE_AUTO:
+           auto_deadman = self.axis_pressed(joy, self.axis_r2)
+           if not auto_deadman:
+               self.cmd_pub.publish(self.zero_twist())
+               return
+           if self.last_nav_cmd is None:
+               self.cmd_pub.publish(self.zero_twist())
+               return
+           self.cmd_pub.publish(self.last_nav_cmd)
+           return
+       self.cmd_pub.publish(self.zero_twist())
+
+def main(args=None) -> None:
+   rclpy.init(args=args)
+   node = DualShockModeTeleop()
+   try:
+       rclpy.spin(node)
+   except KeyboardInterrupt:
+       pass
+   finally:
+       node.cmd_pub.publish(node.zero_twist())
+       node.destroy_node()
+       rclpy.shutdown()
+
+if __name__ == "__main__":
+   main()
