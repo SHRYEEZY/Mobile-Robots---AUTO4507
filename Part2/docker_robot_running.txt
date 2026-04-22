@@ -1,0 +1,77 @@
+ros2 run teleop_twist_joy teleop_node \
+  --ros-args \
+  -p axis_linear.x:=1 \
+  -p axis_angular.yaw:=2 \
+  -p scale_linear.x:=1.0 \
+  -p scale_angular.yaw:=2.0 \
+  -p enable_button:=4 \
+  -p require_enable_button:=true
+
+# Node(
+        #     package='teleop_twist_joy',
+        #     executable='teleop_node',
+        #     name='teleop_node',
+        #     output='screen',
+        #     parameters=[{
+        #         'axis_linear.x': 1,
+        #         'axis_angular.yaw': 2,
+        #         'scale_linear.x': 1.0,
+        #         'scale_angular.yaw': 2.0,
+        #         'enable_button': 4,
+        #         'require_enable_button': True
+        #     }]
+        # ),
+
+ros2 run joy joy_node
+
+ros2 topic echo /joy
+
+ros2 topic echo /cmd_vel
+
+ros2 run ros_gz_bridge parameter_bridge /cmd_vel@geometry_msgs/msg/Twist]gz.msgs.Twist
+
+docker build --no-cache -t pioneer_ros2:latest .
+docker save pioneer_ros2:latest | gzip > pioneer_ros2.tar.gz
+scp pioneer_ros2.tar.gz team15@192.168.2.113:/home/team15/team15/
+ssh team15@<pioneer_ip>
+docker load < /home/team15/pioneer_ros2.tar.gz
+
+docker run -it --rm \
+    --device=/dev/ttyUSB0 \
+    --device=/dev/input/js0 \
+    --network=host \
+    --privileged \
+    pioneer_ros2:latest
+
+
+docker run -it --rm \
+    --device=/dev/ttyUSB0 \
+    --device=/dev/input/js0 \
+    --device=/dev/bus/usb \
+    --network=host \
+    --privileged \
+    pioneer_ros2:latest
+
+
+
+docker run -it --rm \
+    --device=/dev/ttyUSB0 \
+    --device=/dev/input/js0 \
+    --device=/dev/bus/usb \
+    --privileged \
+    --network=host \
+    -e DISPLAY=$DISPLAY \
+    -v /tmp/.X11-unix:/tmp/.X11-unix \
+    pioneer_ros2:latest \
+    ros2 launch /root/ros2_ws/launch/real_robot.launch.py
+
+
+ros2 launch /root/ros2_ws/launch/real_robot.launch.py
+
+docker exec -it <container_name> bash
+source /opt/ros/jazzy/setup.bash
+ros2 topic list
+
+python3 -c "import depthai as dai; print(dai.Device.getAllAvailableDevices())"
+
+python3 -c "import depthai; [print(device.getDeviceId(), device.state) for device in depthai.Device.getAllAvailableDevices()]"
