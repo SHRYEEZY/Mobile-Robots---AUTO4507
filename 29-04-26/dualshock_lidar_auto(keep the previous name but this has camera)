@@ -1,0 +1,829 @@
+#!/usr/bin/env python3
+
+import math
+import time
+import threading
+import os
+from typing import Optional
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
+
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Joy, LaserScan, Image
+from std_msgs.msg import String
+
+from cv_bridge import CvBridge
+import depthai as dai
+import cv2
+
+
+class DualShockLidarAuto(Node):
+    """
+    Combined DualShock manual teleop + LiDAR autonomous mode + OAK camera capture.
+
+    Modes:
+      - MANUAL:
+          O button selects MANUAL.
+          L2 deadman must be held.
+          Right stick Y controls linear x.
+          Left stick X controls angular z.
+
+      - AUTO:
+          X button selects AUTO.
+          R2 deadman must be held.
+          LiDAR autonomous logic runs:
+            1. Wait startup delay
+            2. Run startup movement sequence ONCE ONLY
+            3. Wait for LiDAR confirmation
+            4. Drive forward
+            5. Stop if obstacle ahead
+            6. Capture one OAK photo when obstacle stop occurs
+            7. Resume when clear
+
+    Important:
+      The startup sequence only runs once for the lifetime of this node.
+      If you go AUTO -> MANUAL -> AUTO, the sequence is skipped next time.
+
+      Camera capture happens once per obstacle-stop event.
+      It will not repeatedly save photos while the same obstacle remains detected.
+    """
+
+    MODE_MANUAL = "manual"
+    MODE_AUTO = "auto"
+
+    AUTO_IDLE = "IDLE"
+    AUTO_WAITING = "WAITING"
+    AUTO_SEQUENCE = "SEQUENCE"
+    AUTO_WAIT_LIDAR = "WAIT_LIDAR"
+    AUTO_DRIVING = "DRIVING"
+    AUTO_STOPPED = "STOPPED"
+
+    def __init__(self):
+        super().__init__("dualshock_lidar_auto")
+
+        self.cb_group = ReentrantCallbackGroup()
+
+        # ------------------------------------------------------------------
+        # Parameters
+        # ------------------------------------------------------------------
+
+        self.declare_parameter("cmd_vel_topic", "/cmd_vel")
+        self.declare_parameter("joy_topic", "/joy")
+        self.declare_parameter("scan_topic", "/scan")
+        self.declare_parameter("mode_topic", "/control_mode")
+        self.declare_parameter("status_topic", "/robot_status")
+
+        self.declare_parameter("max_linear", 0.50)
+        self.declare_parameter("max_angular", 2.00)
+        self.declare_parameter("deadzone", 0.10)
+        self.declare_parameter("publish_rate_hz", 20.0)
+
+        # Common DualShock mappings.
+        # Verify using: ros2 topic echo /joy
+        self.declare_parameter("btn_x", 0)
+        self.declare_parameter("btn_circle", 1)
+
+        self.declare_parameter("axis_left_x", 0)
+        self.declare_parameter("axis_right_y", 3)
+        self.declare_parameter("axis_l2", 4)
+        self.declare_parameter("axis_r2", 5)
+
+        # LiDAR/autonomous parameters
+        self.declare_parameter("obstacle_distance_m", 1.0)
+        self.declare_parameter("chassis_min_range_m", 0.5)
+        self.declare_parameter("forward_speed", 0.2)
+        self.declare_parameter("forward_cone_deg", 90.0)
+        self.declare_parameter("startup_delay_s", 3.0)
+        self.declare_parameter("lidar_timeout_s", 10.0)
+
+        # Camera parameters
+        self.declare_parameter("camera_enabled", True)
+        self.declare_parameter("camera_save_dir", "/output")
+        self.declare_parameter("camera_topic", "/oak/rgb/image_raw")
+        self.declare_parameter("camera_publish_rate_hz", 1.0)
+        self.declare_parameter("camera_width", 1920)
+        self.declare_parameter("camera_height", 1080)
+        self.declare_parameter("camera_frame_id", "oak_camera")
+        self.declare_parameter("publish_camera_frames", True)
+
+        self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
+        self.joy_topic = self.get_parameter("joy_topic").value
+        self.scan_topic = self.get_parameter("scan_topic").value
+        self.mode_topic = self.get_parameter("mode_topic").value
+        self.status_topic = self.get_parameter("status_topic").value
+
+        self.max_linear = float(self.get_parameter("max_linear").value)
+        self.max_angular = float(self.get_parameter("max_angular").value)
+        self.deadzone = float(self.get_parameter("deadzone").value)
+        self.publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
+
+        self.btn_x = int(self.get_parameter("btn_x").value)
+        self.btn_circle = int(self.get_parameter("btn_circle").value)
+
+        self.axis_left_x = int(self.get_parameter("axis_left_x").value)
+        self.axis_right_y = int(self.get_parameter("axis_right_y").value)
+        self.axis_l2 = int(self.get_parameter("axis_l2").value)
+        self.axis_r2 = int(self.get_parameter("axis_r2").value)
+
+        self.obstacle_distance_m = float(
+            self.get_parameter("obstacle_distance_m").value
+        )
+        self.chassis_min_range_m = float(
+            self.get_parameter("chassis_min_range_m").value
+        )
+        self.forward_speed = float(self.get_parameter("forward_speed").value)
+        self.forward_cone_deg = float(self.get_parameter("forward_cone_deg").value)
+        self.startup_delay_s = float(self.get_parameter("startup_delay_s").value)
+        self.lidar_timeout_s = float(self.get_parameter("lidar_timeout_s").value)
+
+        self.camera_enabled = bool(self.get_parameter("camera_enabled").value)
+        self.camera_save_dir = self.get_parameter("camera_save_dir").value
+        self.camera_topic = self.get_parameter("camera_topic").value
+        self.camera_publish_rate_hz = float(
+            self.get_parameter("camera_publish_rate_hz").value
+        )
+        self.camera_width = int(self.get_parameter("camera_width").value)
+        self.camera_height = int(self.get_parameter("camera_height").value)
+        self.camera_frame_id = self.get_parameter("camera_frame_id").value
+        self.publish_camera_frames = bool(
+            self.get_parameter("publish_camera_frames").value
+        )
+
+        # ------------------------------------------------------------------
+        # State
+        # ------------------------------------------------------------------
+
+        self._lock = threading.Lock()
+        self._camera_lock = threading.Lock()
+
+        self.mode = self.MODE_MANUAL
+        self.last_joy: Optional[Joy] = None
+
+        self.lidar_ready = False
+        self.obstacle_ahead = False
+
+        self.auto_phase = self.AUTO_IDLE
+        self.auto_started_once = False
+        self.startup_sequence_done = False
+        self.auto_start_time: Optional[float] = None
+
+        self.sequence_thread: Optional[threading.Thread] = None
+        self.sequence_thread_running = False
+
+        self.camera_ready = False
+        self.camera_pipeline = None
+        self.q_rgb = None
+        self.bridge = CvBridge()
+
+        self.obstacle_photo_count = 0
+
+        # ------------------------------------------------------------------
+        # ROS interfaces
+        # ------------------------------------------------------------------
+
+        self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+        self.mode_pub = self.create_publisher(String, self.mode_topic, 10)
+        self.status_pub = self.create_publisher(String, self.status_topic, 10)
+
+        self.camera_pub = self.create_publisher(Image, self.camera_topic, 10)
+
+        self.joy_sub = self.create_subscription(
+            Joy,
+            self.joy_topic,
+            self.joy_callback,
+            10,
+            callback_group=self.cb_group,
+        )
+
+        self.lidar_sub = self.create_subscription(
+            LaserScan,
+            self.scan_topic,
+            self.lidar_callback,
+            10,
+            callback_group=self.cb_group,
+        )
+
+        timer_period = 1.0 / self.publish_rate_hz
+        self.timer = self.create_timer(
+            timer_period,
+            self.control_loop,
+            callback_group=self.cb_group,
+        )
+
+        # Optional continuous camera publishing, useful for rqt_image_view / rviz.
+        # This does NOT save photos every time. Saving only happens on obstacle stop.
+        if self.camera_enabled and self.publish_camera_frames:
+            camera_timer_period = 1.0 / self.camera_publish_rate_hz
+            self.camera_timer = self.create_timer(
+                camera_timer_period,
+                self.publish_camera_frame,
+                callback_group=self.cb_group,
+            )
+        else:
+            self.camera_timer = None
+
+        self.init_camera()
+
+        self.get_logger().info("Combined DualShock + LiDAR + OAK camera node started.")
+        self.get_logger().info("Default mode: MANUAL")
+        self.publish_mode()
+        self.publish_status("Node ready. Default mode is MANUAL.")
+
+    # ----------------------------------------------------------------------
+    # Camera helpers
+    # ----------------------------------------------------------------------
+
+    def init_camera(self):
+        if not self.camera_enabled:
+            self.publish_status("Camera disabled by parameter.")
+            return
+
+        try:
+            os.makedirs(self.camera_save_dir, exist_ok=True)
+
+            self.camera_pipeline = dai.Pipeline()
+
+            cam = self.camera_pipeline.create(dai.node.Camera).build(
+                dai.CameraBoardSocket.CAM_A
+            )
+
+            video_out = cam.requestOutput(
+                (self.camera_width, self.camera_height),
+                type=dai.ImgFrame.Type.BGR888p,
+            )
+
+            self.q_rgb = video_out.createOutputQueue()
+            self.camera_pipeline.start()
+
+            self.camera_ready = True
+
+            self.publish_status(
+                f"OAK camera ready — topic={self.camera_topic}, "
+                f"save_dir={self.camera_save_dir}"
+            )
+
+        except Exception as e:
+            self.camera_ready = False
+            self.q_rgb = None
+            self.camera_pipeline = None
+            self.publish_status(f"WARNING: OAK camera failed to start: {e}")
+
+    def get_camera_frame(self):
+        """
+        Returns latest camera frame if available.
+        Uses tryGet first so the robot control loop/callbacks are not blocked.
+        """
+        if not self.camera_enabled or not self.camera_ready or self.q_rgb is None:
+            return None
+
+        try:
+            in_rgb = self.q_rgb.tryGet()
+
+            if in_rgb is None:
+                return None
+
+            frame = in_rgb.getCvFrame()
+            return frame
+
+        except Exception as e:
+            self.get_logger().error(f"Camera frame read failed: {e}")
+            return None
+
+    def publish_camera_frame(self):
+        frame = self.get_camera_frame()
+
+        if frame is None:
+            return
+
+        try:
+            msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = self.camera_frame_id
+            self.camera_pub.publish(msg)
+
+        except Exception as e:
+            self.get_logger().error(f"Camera publish failed: {e}")
+
+    def capture_obstacle_photo(self):
+        """
+        Capture one photo when an obstacle-stop event occurs.
+        This is called from a separate thread so LiDAR/control callbacks do not block.
+        """
+        with self._camera_lock:
+            if not self.camera_enabled:
+                self.publish_status("Obstacle stop occurred, but camera is disabled.")
+                return
+
+            if not self.camera_ready:
+                self.publish_status("Obstacle stop occurred, but camera is not ready.")
+                return
+
+            # Try for a short moment to get a fresh frame.
+            frame = None
+            start = time.time()
+
+            while time.time() - start < 1.0:
+                frame = self.get_camera_frame()
+                if frame is not None:
+                    break
+                time.sleep(0.05)
+
+            if frame is None:
+                self.publish_status("Obstacle stop occurred, but no camera frame was available.")
+                return
+
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            self.obstacle_photo_count += 1
+
+            filename = os.path.join(
+                self.camera_save_dir,
+                f"obstacle_stop_{self.obstacle_photo_count:03d}_{timestamp}.jpg",
+            )
+
+            try:
+                ok = cv2.imwrite(filename, frame)
+
+                if ok:
+                    self.publish_status(f"Obstacle photo saved: {filename}")
+                else:
+                    self.publish_status(f"WARNING: cv2.imwrite failed for {filename}")
+
+            except Exception as e:
+                self.publish_status(f"Failed to save obstacle photo: {e}")
+
+    def trigger_obstacle_photo_capture(self):
+        """
+        Starts camera capture in a thread.
+        This prevents LiDAR callback from blocking while saving the photo.
+        """
+        thread = threading.Thread(
+            target=self.capture_obstacle_photo,
+            daemon=True,
+        )
+        thread.start()
+
+    # ----------------------------------------------------------------------
+    # Basic helpers
+    # ----------------------------------------------------------------------
+
+    def publish_mode(self):
+        msg = String()
+        msg.data = self.mode
+        self.mode_pub.publish(msg)
+
+    def publish_status(self, text: str):
+        msg = String()
+        msg.data = f"[mode={self.mode}] [auto={self.auto_phase}] {text}"
+        self.status_pub.publish(msg)
+        self.get_logger().info(text)
+
+    def zero_twist(self) -> Twist:
+        msg = Twist()
+        msg.linear.x = 0.0
+        msg.angular.z = 0.0
+        return msg
+
+    def send_cmd(self, lin: float = 0.0, ang: float = 0.0):
+        msg = Twist()
+        msg.linear.x = lin
+        msg.angular.z = ang
+        self.cmd_pub.publish(msg)
+
+    def stop_robot(self):
+        self.send_cmd(0.0, 0.0)
+
+    def apply_deadzone(self, value: float) -> float:
+        if abs(value) < self.deadzone:
+            return 0.0
+        return value
+
+    def button_pressed(self, joy: Joy, button_index: int) -> bool:
+        if button_index >= len(joy.buttons):
+            return False
+        return joy.buttons[button_index] == 1
+
+    def axis_pressed(self, joy: Joy, axis_index: int, threshold: float = 0.5) -> bool:
+        """
+        For many controllers:
+          trigger released = +1.0
+          trigger pressed  = -1.0
+
+        Therefore this treats axis value < threshold as pressed.
+        """
+        if axis_index >= len(joy.axes):
+            return False
+        return joy.axes[axis_index] < threshold
+
+    def auto_deadman_held(self) -> bool:
+        with self._lock:
+            joy = self.last_joy
+
+        if joy is None:
+            return False
+
+        return self.axis_pressed(joy, self.axis_r2)
+
+    def manual_deadman_held(self) -> bool:
+        with self._lock:
+            joy = self.last_joy
+
+        if joy is None:
+            return False
+
+        return self.axis_pressed(joy, self.axis_l2)
+
+    # ----------------------------------------------------------------------
+    # Joy callback
+    # ----------------------------------------------------------------------
+
+    def joy_callback(self, msg: Joy):
+        with self._lock:
+            self.last_joy = msg
+
+        if self.button_pressed(msg, self.btn_circle):
+            if self.mode != self.MODE_MANUAL:
+                with self._lock:
+                    self.mode = self.MODE_MANUAL
+                self.stop_robot()
+                self.publish_mode()
+                self.publish_status("Switched to MANUAL mode")
+
+        if self.button_pressed(msg, self.btn_x):
+            if self.mode != self.MODE_AUTO:
+                with self._lock:
+                    self.mode = self.MODE_AUTO
+
+                    if not self.auto_started_once:
+                        self.auto_started_once = True
+                        self.auto_start_time = time.time()
+
+                        if self.startup_sequence_done:
+                            self.auto_phase = self.AUTO_DRIVING
+                        else:
+                            self.auto_phase = self.AUTO_WAITING
+                    else:
+                        if self.startup_sequence_done:
+                            if self.obstacle_ahead:
+                                self.auto_phase = self.AUTO_STOPPED
+                            else:
+                                self.auto_phase = self.AUTO_DRIVING
+                        else:
+                            self.auto_phase = self.AUTO_WAITING
+
+                self.stop_robot()
+                self.publish_mode()
+                self.publish_status("Switched to AUTO mode")
+
+    # ----------------------------------------------------------------------
+    # LiDAR callback
+    # ----------------------------------------------------------------------
+
+    def lidar_callback(self, msg: LaserScan):
+        first_scan = False
+
+        with self._lock:
+            if not self.lidar_ready:
+                self.lidar_ready = True
+                first_scan = True
+
+        if first_scan:
+            self.publish_status(
+                "LiDAR is ON — first scan received "
+                f"({len(msg.ranges)} rays, "
+                f"{math.degrees(msg.angle_min):.1f} deg to "
+                f"{math.degrees(msg.angle_max):.1f} deg)"
+            )
+
+        cone_rad = math.radians(self.forward_cone_deg)
+
+        obstacle_found = False
+
+        for i, r in enumerate(msg.ranges):
+            angle = msg.angle_min + i * msg.angle_increment
+
+            if abs(angle) > cone_rad:
+                continue
+
+            if math.isnan(r) or math.isinf(r):
+                continue
+
+            if r > msg.range_max:
+                continue
+
+            if r < self.chassis_min_range_m:
+                continue
+
+            if r < self.obstacle_distance_m:
+                obstacle_found = True
+                break
+
+        with self._lock:
+            prev = self.obstacle_ahead
+            self.obstacle_ahead = obstacle_found
+            current_mode = self.mode
+            current_phase = self.auto_phase
+
+        if obstacle_found and not prev:
+            self.publish_status(
+                f"OBSTACLE within {self.obstacle_distance_m:.2f} m — stopping!"
+            )
+
+            if current_mode == self.MODE_AUTO:
+                self.stop_robot()
+
+                # This is the key integration:
+                # one photo per new obstacle-stop event.
+                self.trigger_obstacle_photo_capture()
+
+        elif not obstacle_found and prev:
+            if current_mode == self.MODE_AUTO and current_phase == self.AUTO_STOPPED:
+                self.publish_status("Path clear — ready to resume autonomous drive")
+
+    # ----------------------------------------------------------------------
+    # Startup sequence helpers
+    # ----------------------------------------------------------------------
+
+    def run_motion(self, lin: float, ang: float, duration: float, label: str):
+        """
+        Motion helper for startup sequence.
+
+        It keeps checking:
+          - are we still in AUTO?
+          - is R2 still held?
+
+        If either becomes false, the sequence pauses/stops safely.
+        The sequence is not marked done unless all motions complete.
+        """
+
+        self.publish_status(label)
+
+        start = time.time()
+
+        while time.time() - start < duration:
+            with self._lock:
+                current_mode = self.mode
+
+            if current_mode != self.MODE_AUTO:
+                self.stop_robot()
+                self.publish_status("Startup sequence interrupted: left AUTO mode")
+                return False
+
+            if not self.auto_deadman_held():
+                self.stop_robot()
+                self.publish_status("Startup sequence paused: R2 auto deadman released")
+                return False
+
+            self.send_cmd(lin, ang)
+            time.sleep(0.05)
+
+        self.stop_robot()
+        time.sleep(0.3)
+        return True
+
+    def startup_sequence_worker(self):
+        with self._lock:
+            self.sequence_thread_running = True
+            self.auto_phase = self.AUTO_SEQUENCE
+
+        self.publish_status("=== Starting startup motion sequence ===")
+
+        sequence_ok = True
+
+        sequence_ok = sequence_ok and self.run_motion(
+            0.2, 0.0, 1.5, "Startup: forward"
+        )
+        sequence_ok = sequence_ok and self.run_motion(
+            -0.2, 0.0, 1.5, "Startup: backward"
+        )
+        sequence_ok = sequence_ok and self.run_motion(
+            0.0, -0.4, 1.0, "Startup: turn right"
+        )
+        sequence_ok = sequence_ok and self.run_motion(
+            0.0, 0.4, 2.0, "Startup: turn left"
+        )
+        sequence_ok = sequence_ok and self.run_motion(
+            0.0, -0.4, 1.0, "Startup: return to centre"
+        )
+
+        if not sequence_ok:
+            with self._lock:
+                self.sequence_thread_running = False
+
+                if self.mode == self.MODE_AUTO:
+                    self.auto_phase = self.AUTO_WAITING
+                    self.auto_start_time = time.time()
+
+            self.stop_robot()
+            return
+
+        self.publish_status("=== Startup sequence complete ===")
+
+        with self._lock:
+            self.startup_sequence_done = True
+            self.auto_phase = self.AUTO_WAIT_LIDAR
+
+        self.wait_for_lidar()
+
+        with self._lock:
+            self.sequence_thread_running = False
+
+            if self.mode == self.MODE_AUTO:
+                if self.obstacle_ahead:
+                    self.auto_phase = self.AUTO_STOPPED
+                else:
+                    self.auto_phase = self.AUTO_DRIVING
+
+        self.publish_status(
+            "Autonomous forward drive ready "
+            f"(obstacle threshold = {self.obstacle_distance_m:.2f} m, "
+            f"forward cone = ±{self.forward_cone_deg:.0f} deg)"
+        )
+
+    def wait_for_lidar(self):
+        self.publish_status("Waiting for LiDAR scan...")
+
+        timeout_time = time.time() + self.lidar_timeout_s
+
+        while True:
+            with self._lock:
+                ready = self.lidar_ready
+                current_mode = self.mode
+
+            if ready:
+                return
+
+            if current_mode != self.MODE_AUTO:
+                self.publish_status("Stopped waiting for LiDAR: left AUTO mode")
+                return
+
+            if not self.auto_deadman_held():
+                self.stop_robot()
+                time.sleep(0.1)
+                continue
+
+            if time.time() > timeout_time:
+                self.publish_status(
+                    "WARNING: LiDAR timeout — continuing without confirmation"
+                )
+                return
+
+            time.sleep(0.1)
+
+    def start_sequence_thread_if_needed(self):
+        with self._lock:
+            already_running = self.sequence_thread_running
+
+        if already_running:
+            return
+
+        self.sequence_thread = threading.Thread(
+            target=self.startup_sequence_worker,
+            daemon=True,
+        )
+        self.sequence_thread.start()
+
+    # ----------------------------------------------------------------------
+    # Main control loop
+    # ----------------------------------------------------------------------
+
+    def control_loop(self):
+        with self._lock:
+            joy = self.last_joy
+            mode = self.mode
+            auto_phase = self.auto_phase
+            obstacle = self.obstacle_ahead
+            auto_start_time = self.auto_start_time
+            startup_sequence_done = self.startup_sequence_done
+
+        if joy is None:
+            self.stop_robot()
+            return
+
+        # ------------------------------------------------------------------
+        # MANUAL MODE
+        # ------------------------------------------------------------------
+
+        if mode == self.MODE_MANUAL:
+            if not self.manual_deadman_held():
+                self.stop_robot()
+                return
+
+            linear_input = 0.0
+            angular_input = 0.0
+
+            if self.axis_right_y < len(joy.axes):
+                linear_input = joy.axes[self.axis_right_y]
+
+            if self.axis_left_x < len(joy.axes):
+                angular_input = joy.axes[self.axis_left_x]
+
+            linear_input = self.apply_deadzone(linear_input)
+            angular_input = self.apply_deadzone(angular_input)
+
+            cmd = Twist()
+            cmd.linear.x = self.max_linear * linear_input
+            cmd.angular.z = self.max_angular * angular_input
+
+            self.cmd_pub.publish(cmd)
+            return
+
+        # ------------------------------------------------------------------
+        # AUTO MODE
+        # ------------------------------------------------------------------
+
+        if mode == self.MODE_AUTO:
+            if not self.auto_deadman_held():
+                self.stop_robot()
+                return
+
+            if startup_sequence_done:
+                if obstacle:
+                    with self._lock:
+                        self.auto_phase = self.AUTO_STOPPED
+                    self.stop_robot()
+                    return
+                else:
+                    with self._lock:
+                        self.auto_phase = self.AUTO_DRIVING
+                    self.send_cmd(lin=self.forward_speed, ang=0.0)
+                    return
+
+            # Startup sequence has not been completed yet.
+            if auto_phase == self.AUTO_WAITING:
+                if auto_start_time is None:
+                    with self._lock:
+                        self.auto_start_time = time.time()
+                    self.stop_robot()
+                    return
+
+                elapsed = time.time() - auto_start_time
+
+                if elapsed < self.startup_delay_s:
+                    self.stop_robot()
+                    return
+
+                self.start_sequence_thread_if_needed()
+                return
+
+            if auto_phase in [self.AUTO_SEQUENCE, self.AUTO_WAIT_LIDAR]:
+                # Worker thread is controlling motion/waiting.
+                return
+
+            if auto_phase == self.AUTO_STOPPED:
+                self.stop_robot()
+
+                if not obstacle and startup_sequence_done:
+                    with self._lock:
+                        self.auto_phase = self.AUTO_DRIVING
+                    self.publish_status("Path clear — resuming autonomous drive")
+
+                return
+
+            if auto_phase == self.AUTO_IDLE:
+                with self._lock:
+                    self.auto_phase = self.AUTO_WAITING
+                    self.auto_start_time = time.time()
+                self.stop_robot()
+                return
+
+        self.stop_robot()
+
+    def destroy_node(self):
+        self.stop_robot()
+
+        if self.camera_pipeline is not None:
+            try:
+                self.camera_pipeline.stop()
+            except Exception as e:
+                self.get_logger().warn(f"Camera pipeline stop failed: {e}")
+
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    node = DualShockLidarAuto()
+
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.stop_robot()
+        node.destroy_node()
+
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
