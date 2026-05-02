@@ -1,0 +1,78 @@
+from launch import LaunchDescription
+from launch.actions import IncludeLaunchDescription, TimerAction
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
+import os
+
+
+def generate_launch_description():
+
+    # ── DepthAI camera (optional) ─────────────────────────────────────────────
+    depthai_driver_launch = os.path.join(
+        get_package_share_directory('depthai_ros_driver_v3'),
+        'launch',
+        'driver.launch.py'
+    )
+
+    return LaunchDescription([
+
+        # ── 1. Pioneer base driver ────────────────────────────────────────────
+        Node(
+            package='ariaNode',
+            executable='ariaNode',
+            name='ariaNode',
+            output='screen',
+            arguments=['-rp', '/dev/ttyUSB0'],
+        ),
+
+        # ── 2. Lakibeam LiDAR ─────────────────────────────────────────────────
+        Node(
+            package='lakibeam1',
+            executable='lakibeam1_scan_node',
+            name='lakibeam_lidar',
+            output='screen',
+            parameters=[{
+                'frame_id':         'laser',
+                'output_topic':     'scan',
+                'sensorip':         '192.168.198.2',
+                'hostip':           '0.0.0.0',
+                'port':             '2368',
+                'inverted':         False,
+                'angle_offset':     0,
+                'scanfreq':         '30',
+                'filter':           '3',
+                'laser_enable':     'true',
+                'scan_range_start': '0',
+                'scan_range_stop':  '360',
+            }],
+        ),
+
+        # ── 3. Joy node (REQUIRED for DualShock) ──────────────────────────────
+        Node(
+            package='joy',
+            executable='joy_node',
+            name='joy_node',
+            output='screen',
+            parameters=[{'dev': '/dev/input/js0'}]
+        ),
+
+        # ── 4. DualShock teleop + AUTO mode ───────────────────────────────────
+        TimerAction(
+            period=2.0,
+            actions=[
+                Node(
+                    package='project1',
+                    executable='dual_shock_mode_teleop',  # ⚠️ verify this
+                    name='dualshock_mode_teleop',
+                    output='screen',
+                ),
+            ]
+        ),
+
+        # ── 5. DepthAI camera (OPTIONAL) ──────────────────────────────────────
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(depthai_driver_launch)
+        ),
+
+    ])
