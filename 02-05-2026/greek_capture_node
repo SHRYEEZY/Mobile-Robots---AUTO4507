@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+import os
+import time
+
+import rclpy
+from rclpy.node import Node
+
+import cv2
+import depthai as dai
+
+
+class GreekCaptureNode(Node):
+    def __init__(self):
+        super().__init__("greek_capture_node")
+
+        self.declare_parameter("save_dir", "/tmp/greek_raw")
+        self.declare_parameter("class_name", "unknown")
+        self.declare_parameter("capture_rate", 1.0)
+
+        self.save_dir = str(self.get_parameter("save_dir").value)
+        self.class_name = str(self.get_parameter("class_name").value)
+        self.capture_rate = float(self.get_parameter("capture_rate").value)
+
+        self.class_dir = os.path.join(self.save_dir, self.class_name)
+        os.makedirs(self.class_dir, exist_ok=True)
+
+        self.pipeline = dai.Pipeline()
+        cam = self.pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+
+        video_out = cam.requestOutput(
+            (1920, 1080),
+            type=dai.ImgFrame.Type.BGR888p
+        )
+
+        self.q_rgb = video_out.createOutputQueue()
+        self.pipeline.start()
+
+        self.photo_count = 0
+
+        self.timer = self.create_timer(
+            1.0 / self.capture_rate,
+            self.capture_photo
+        )
+
+        self.get_logger().info(f"OAK ready. Saving {self.class_name} images to {self.class_dir}")
+
+    def capture_photo(self):
+        try:
+            in_rgb = self.q_rgb.get()
+            frame = in_rgb.getCvFrame()
+        except Exception as e:
+            self.get_logger().error(f"Frame capture failed: {e}")
+            return
+
+        self.photo_count += 1
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join(
+            self.class_dir,
+            f"{self.class_name}_{self.photo_count:04d}_{timestamp}.jpg"
+        )
+
+        ok = cv2.imwrite(filename, frame)
+
+        if ok:
+            self.get_logger().info(f"Saved: {filename}")
+        else:
+            self.get_logger().warn(f"Failed to save: {filename}")
+
+    def destroy_node(self):
+        try:
+            self.pipeline.stop()
+        except Exception:
+            pass
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = GreekCaptureNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
