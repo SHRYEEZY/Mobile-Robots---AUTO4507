@@ -1,0 +1,234 @@
+# project1/launch/real_robot.launch.py
+
+from launch import LaunchDescription
+from launch.actions import TimerAction, ExecuteProcess
+from launch_ros.actions import Node
+from launch.substitutions import PathJoinSubstitution
+from launch_ros.substitutions import FindPackageShare
+
+
+def generate_launch_description():
+
+    return LaunchDescription([
+
+        # -----------------------------------------------------
+        # 1. Pioneer base driver
+        # -----------------------------------------------------
+
+        Node(
+            package='ariaNode',
+            executable='ariaNode',
+            name='ariaNode',
+            output='screen',
+            arguments=['-rp', '/dev/ttyUSB0'],
+        ),
+
+        # -----------------------------------------------------
+        # 2. Lakibeam LiDAR
+        # -----------------------------------------------------
+
+        Node(
+            package='lakibeam1',
+            executable='lakibeam1_scan_node',
+            name='lakibeam_lidar',
+            output='screen',
+            parameters=[{
+                'frame_id':         'laser',
+                'output_topic':     'scan',
+                'sensorip':         '192.168.198.2',
+                'hostip':           '0.0.0.0',
+                'port':             '2368',
+                'inverted':         False,
+                'angle_offset':     0,
+                'scanfreq':         '30',
+                'filter':           '3',
+                'laser_enable':     'true',
+                'scan_range_start': '0',
+                'scan_range_stop':  '360',
+            }],
+        ),
+
+        # -----------------------------------------------------
+        # 3. Phidget IMU
+        #    Publishes /imu/data — consumed by EKF
+        # -----------------------------------------------------
+
+        Node(
+            package='phidgets_spatial',
+            executable='phidgets_spatial_node',
+            name='phidgets_spatial',
+            output='screen',
+            parameters=[{
+                'frame_id':                    'imu_link',
+                'linear_acceleration_stdev':   0.01,
+                'angular_velocity_stdev':      0.005,
+                'magnetic_field_stdev':        0.001,
+                'data_interval_ms':            8,
+            }]
+        ),
+
+        # -----------------------------------------------------
+        # 4. Odom publisher
+        #    Subscribes to ariaNode /odom, broadcasts
+        #    odom->base_link TF for SLAM.
+        #    EKF reads /odom directly and publishes
+        #    /odometry/filtered (no TF conflict because
+        #    ekf publish_tf is false in ekf.yaml).
+        # -----------------------------------------------------
+
+        Node(
+            package='project1',
+            executable='odom_publisher',
+            name='odom_publisher',
+            output='screen',
+        ),
+
+        # -----------------------------------------------------
+        # 5. Joy node
+        # -----------------------------------------------------
+
+        Node(
+            package='joy',
+            executable='joy_node',
+            name='joy_node',
+            output='screen',
+            parameters=[{'dev': '/dev/input/js0'}]
+        ),
+
+        # -----------------------------------------------------
+        # 6. Foxglove bridge
+        # -----------------------------------------------------
+
+        Node(
+            package='foxglove_bridge',
+            executable='foxglove_bridge',
+            name='foxglove_bridge',
+            output='screen',
+            parameters=[{
+                'port':    8765,
+                'address': '0.0.0.0',
+            }]
+        ),
+
+        # -----------------------------------------------------
+        # 7. EKF — fuses /odom + /imu/data
+        #    Publishes /odometry/filtered (used by waypoint
+        #    controller for accurate pose).
+        #    publish_tf is FALSE — odom_publisher owns the TF.
+        # -----------------------------------------------------
+
+        Node(
+            package='robot_localization',
+            executable='ekf_node',
+            name='ekf_filter_node',
+            output='screen',
+            parameters=[
+                PathJoinSubstitution([
+                    FindPackageShare('project1'),
+                    'config',
+                    'ekf.yaml'
+                ])
+            ]
+        ),
+
+        # -----------------------------------------------------
+        # 8. Static TF: base_link -> laser
+        #    LiDAR mounted ~0.2m above base, centred
+        # -----------------------------------------------------
+
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='base_link_to_laser',
+            output='screen',
+            arguments=['0', '0', '0.2', '0', '0', '0', 'base_link', 'laser']
+        ),
+
+        # -----------------------------------------------------
+        # 9. Static TF: base_link -> imu_link
+        #    IMU assumed centred on robot at base height
+        # -----------------------------------------------------
+
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='base_link_to_imu',
+            output='screen',
+            arguments=['0', '0', '0', '0', '0', '0', 'base_link', 'imu_link']
+        ),
+
+        # -----------------------------------------------------
+        # 10. SLAM toolbox (delayed 3s to let odom/TF settle)
+        # -----------------------------------------------------
+
+        TimerAction(
+            period=3.0,
+            actions=[
+                Node(
+                    package='slam_toolbox',
+                    executable='sync_slam_toolbox_node',
+                    name='slam_toolbox',
+                    output='screen',
+                    parameters=[{
+                        'use_sim_time':              False,
+                        'odom_frame':                'odom',
+                        'map_frame':                 'map',
+                        'base_frame':                'base_link',
+                        'scan_topic':                '/scan',
+                        'mode':                      'mapping',
+                        'resolution':                0.05,
+                        'max_laser_range':           20.0,
+                        'minimum_travel_distance':   0.1,
+                        'minimum_travel_heading':    0.1,
+                        'use_scan_matching':         True,
+                        'do_loop_closing':           True,
+                        'transform_publish_period':  0.02,
+                        'map_update_interval':       5.0,
+                        'transform_timeout':         0.2,
+                        'tf_buffer_duration':        30.0,
+                    }],
+                ),
+            ]
+        ),
+
+        # -----------------------------------------------------
+        # 11. SLAM lifecycle transitions
+        # -----------------------------------------------------
+
+        TimerAction(
+            period=4.5,
+            actions=[
+                ExecuteProcess(
+                    cmd=['ros2', 'lifecycle', 'set', '/slam_toolbox', 'configure'],
+                    output='screen',
+                ),
+            ]
+        ),
+
+        TimerAction(
+            period=5.0,
+            actions=[
+                ExecuteProcess(
+                    cmd=['ros2', 'lifecycle', 'set', '/slam_toolbox', 'activate'],
+                    output='screen',
+                ),
+            ]
+        ),
+
+        # -----------------------------------------------------
+        # 12. Main teleop + waypoint auto node (delayed 2s)
+        # -----------------------------------------------------
+
+        TimerAction(
+            period=2.0,
+            actions=[
+                Node(
+                    package='project1',
+                    executable='dual_shock_mode_teleop.py',
+                    name='dualshock_mode_teleop',
+                    output='screen',
+                ),
+            ]
+        ),
+
+    ])

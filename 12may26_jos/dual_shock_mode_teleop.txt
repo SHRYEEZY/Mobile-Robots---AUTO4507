@@ -1,0 +1,587 @@
+#!/usr/bin/env python3
+import math
+import time
+import threading
+import os
+from typing import Optional, List, Tuple
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
+
+from geometry_msgs.msg import Twist, TransformStamped
+from sensor_msgs.msg import Joy, LaserScan
+from std_msgs.msg import String
+import tf2_ros
+import tf2_py
+
+import cv2
+try:
+    import depthai as dai
+    DEPTHAI_AVAILABLE = True
+except ImportError:
+    DEPTHAI_AVAILABLE = False
+
+# ── Tuning ────────────────────────────────────────────────────────────────────
+OBSTACLE_DISTANCE_M  = 1.0
+CHASSIS_MIN_RANGE_M  = 0.5
+FORWARD_SPEED        = 0.2
+ANGULAR_SPEED        = 0.4
+FORWARD_CONE_DEG     = 90
+STARTUP_DELAY_S      = 3.0
+WAYPOINT_TOLERANCE_M = 0.5    # metres — how close = "reached"
+CAMERA_SAVE_DIR      = "/root/auto4508_ws/photos"
+WAYPOINTS_FILE       = "/root/auto4508_ws/src/project1/config/waypoints.txt"
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def load_waypoints(filepath: str) -> List[Tuple[float, float]]:
+    """Load waypoints from file — each line is 'x y' in metres."""
+    waypoints = []
+    try:
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    waypoints.append((float(parts[0]), float(parts[1])))
+    except Exception as e:
+        print(f"WARNING: Could not load waypoints from {filepath}: {e}")
+    return waypoints
+
+
+def nearest_unvisited(
+    waypoints: List[Tuple[float, float]],
+    visited: List[bool],
+    robot_x: float,
+    robot_y: float
+) -> int:
+    """Return index of nearest unvisited waypoint, or -1 if all visited."""
+    best_idx  = -1
+    best_dist = float('inf')
+    for i, (wx, wy) in enumerate(waypoints):
+        if visited[i]:
+            continue
+        d = math.hypot(wx - robot_x, wy - robot_y)
+        if d < best_dist:
+            best_dist = d
+            best_idx  = i
+    return best_idx
+
+
+class DualShockModeTeleop(Node):
+    MODE_MANUAL = "manual"
+    MODE_AUTO   = "auto"
+
+    def __init__(self) -> None:
+        super().__init__("dualshock_mode_teleop")
+        self.cb_group = ReentrantCallbackGroup()
+
+        # Parameters
+        self.declare_parameter("cmd_vel_topic",   "/cmd_vel")
+        self.declare_parameter("joy_topic",       "/joy")
+        self.declare_parameter("mode_topic",      "/control_mode")
+        self.declare_parameter("status_topic",    "/robot_status")
+        self.declare_parameter("scan_topic",      "/scan")
+        self.declare_parameter("max_linear",      0.50)
+        self.declare_parameter("max_angular",     2.00)
+        self.declare_parameter("deadzone",        0.10)
+        self.declare_parameter("publish_rate_hz", 20.0)
+        self.declare_parameter("btn_x",           0)
+        self.declare_parameter("btn_circle",      1)
+        self.declare_parameter("axis_left_x",     0)
+        self.declare_parameter("axis_right_y",    3)
+        self.declare_parameter("axis_l2",         4)
+        self.declare_parameter("axis_r2",         5)
+
+        self.max_linear      = float(self.get_parameter("max_linear").value)
+        self.max_angular     = float(self.get_parameter("max_angular").value)
+        self.deadzone        = float(self.get_parameter("deadzone").value)
+        self.publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
+        self.btn_x           = int(self.get_parameter("btn_x").value)
+        self.btn_circle      = int(self.get_parameter("btn_circle").value)
+        self.axis_left_x     = int(self.get_parameter("axis_left_x").value)
+        self.axis_right_y    = int(self.get_parameter("axis_right_y").value)
+        self.axis_l2         = int(self.get_parameter("axis_l2").value)
+        self.axis_r2         = int(self.get_parameter("axis_r2").value)
+
+        # Robot state
+        self._lock           = threading.Lock()
+        self._camera_lock    = threading.Lock()
+        self.mode            = self.MODE_MANUAL
+        self.last_joy: Optional[Joy] = None
+        self.lidar_ready     = False
+        self.obstacle_ahead  = False
+        self.auto_phase      = "IDLE"
+        self.auto_start_time = None
+        self.photo_count     = 0
+
+        # Robot pose from SLAM TF (map -> base_link)
+        self.robot_x   = 0.0
+        self.robot_y   = 0.0
+        self.robot_yaw = 0.0
+
+        # Waypoints
+        self.waypoints = load_waypoints(WAYPOINTS_FILE)
+        self.visited   = [False] * len(self.waypoints)
+        self.current_wp_idx = -1
+        if self.waypoints:
+            self._log(f"Loaded {len(self.waypoints)} waypoints from {WAYPOINTS_FILE}")
+            for i, (x, y) in enumerate(self.waypoints):
+                self._log(f"  WP{i+1}: ({x:.2f}, {y:.2f})")
+        else:
+            self._log(f"WARNING: No waypoints loaded from {WAYPOINTS_FILE}")
+
+        # Camera state
+        self.camera_ready    = False
+        self.pipeline        = None
+        self.q_rgb           = None
+
+        # TF buffer for reading SLAM pose
+        self.tf_buffer   = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # ROS publishers/subscribers
+        self.cmd_pub    = self.create_publisher(Twist,  "/cmd_vel",       10)
+        self.mode_pub   = self.create_publisher(String, "/control_mode",  10)
+        self.status_pub = self.create_publisher(String, "/robot_status",  10)
+
+        self.create_subscription(Joy,       "/joy",  self.joy_callback,   10, callback_group=self.cb_group)
+        self.create_subscription(LaserScan, "/scan", self.lidar_callback, 10, callback_group=self.cb_group)
+        self.create_timer(1.0 / self.publish_rate_hz, self.control_loop,  callback_group=self.cb_group)
+
+        # Camera setup
+        self._init_camera()
+
+        self.get_logger().info("DualShock + Waypoint ready — MANUAL default")
+        self.get_logger().info("X=AUTO(hold R2)  O=MANUAL(hold L2)")
+
+    # ── Pose ─────────────────────────────────────────────────────────────────
+
+    def _update_pose(self):
+        """Read current robot pose from SLAM TF (map -> base_link)."""
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                'map', 'base_link',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.1)
+            )
+            self.robot_x = tf.transform.translation.x
+            self.robot_y = tf.transform.translation.y
+
+            # Extract yaw from quaternion
+            q = tf.transform.rotation
+            siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+            self.robot_yaw = math.atan2(siny_cosp, cosy_cosp)
+            return True
+        except Exception:
+            return False
+
+    # ── Camera ───────────────────────────────────────────────────────────────
+
+    def _init_camera(self):
+        if not DEPTHAI_AVAILABLE:
+            self._log("WARNING: depthai not installed — camera disabled")
+            return
+        try:
+            os.makedirs(CAMERA_SAVE_DIR, exist_ok=True)
+            self.pipeline = dai.Pipeline()
+            cam = self.pipeline.create(dai.node.Camera).build(
+                dai.CameraBoardSocket.CAM_A
+            )
+            video_out = cam.requestOutput(
+                (1920, 1080), type=dai.ImgFrame.Type.BGR888p
+            )
+            self.q_rgb = video_out.createOutputQueue()
+            self.pipeline.start()
+            self.camera_ready = True
+            self._log(f"OAK camera ready — saving to {CAMERA_SAVE_DIR}")
+        except Exception as e:
+            self.camera_ready = False
+            self._log(f"WARNING: OAK camera failed: {e}")
+
+    def _get_camera_frame(self):
+        if not self.camera_ready or self.q_rgb is None:
+            return None
+        try:
+            in_rgb = self.q_rgb.tryGet()
+            return in_rgb.getCvFrame() if in_rgb else None
+        except Exception as e:
+            self._log(f"Camera frame error: {e}")
+            return None
+
+    def _capture_photo(self, label="obstacle"):
+        with self._camera_lock:
+            if not self.camera_ready:
+                return
+            frame = None
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                frame = self._get_camera_frame()
+                if frame is not None:
+                    break
+                time.sleep(0.05)
+            if frame is None:
+                self._log("No camera frame available")
+                return
+            self.photo_count += 1
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = os.path.join(
+                CAMERA_SAVE_DIR,
+                f"{label}_{self.photo_count:03d}_{timestamp}.jpg"
+            )
+            try:
+                if cv2.imwrite(filename, frame):
+                    self._log(f"Photo saved: {filename}")
+                else:
+                    self._log(f"WARNING: Failed to save photo: {filename}")
+            except Exception as e:
+                self._log(f"Photo save error: {e}")
+
+    def _trigger_photo(self, label="obstacle"):
+        t = threading.Thread(target=self._capture_photo, args=(label,), daemon=True)
+        t.start()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _log(self, msg):
+        self.get_logger().info(msg)
+        s = String(); s.data = msg
+        self.status_pub.publish(s)
+
+    def _send_cmd(self, lin=0.0, ang=0.0):
+        t = Twist(); t.linear.x = lin; t.angular.z = ang
+        self.cmd_pub.publish(t)
+
+    def _stop(self):
+        try: self._send_cmd(0.0, 0.0)
+        except: pass
+
+    def apply_deadzone(self, v):
+        return 0.0 if abs(v) < self.deadzone else v
+
+    def axis_pressed(self, joy, idx, threshold=0.5):
+        return len(joy.axes) > idx and joy.axes[idx] < threshold
+
+    def btn_down(self, joy, idx):
+        return len(joy.buttons) > idx and joy.buttons[idx] == 1
+
+    # ── LiDAR ─────────────────────────────────────────────────────────────────
+
+    def lidar_callback(self, msg: LaserScan):
+        with self._lock:
+            if not self.lidar_ready:
+                self.lidar_ready = True
+                self._log(f"LiDAR ready — {len(msg.ranges)} rays")
+
+        cone = math.radians(FORWARD_CONE_DEG)
+        found = False
+        for i, r in enumerate(msg.ranges):
+            angle = msg.angle_min + i * msg.angle_increment
+            if abs(angle) > cone:               continue
+            if math.isnan(r) or math.isinf(r): continue
+            if r > msg.range_max:               continue
+            if r < CHASSIS_MIN_RANGE_M:         continue
+            if r < OBSTACLE_DISTANCE_M:
+                found = True; break
+
+        with self._lock:
+            prev = self.obstacle_ahead
+            self.obstacle_ahead = found
+            mode  = self.mode
+            phase = self.auto_phase
+
+        if mode == self.MODE_AUTO:
+            if found and not prev:
+                self._log("OBSTACLE — stopping!")
+                self._stop()
+                self._trigger_photo("obstacle")
+            elif not found and prev and phase in ("DRIVING", "WAYPOINT"):
+                self._log("Path clear — resuming")
+
+    # ── Motion helpers ────────────────────────────────────────────────────────
+
+    def _run_motion(self, lin, ang, dur, label):
+        self._log(label)
+        t0 = time.time()
+        while time.time() - t0 < dur:
+            with self._lock:
+                if self.mode == self.MODE_MANUAL:
+                    self._stop(); return
+            self._send_cmd(lin, ang)
+            time.sleep(0.05)
+        self._stop()
+        time.sleep(0.3)
+
+    def _run_sequence(self):
+        self._log("=== Sequence start ===")
+        self._run_motion( 0.2,  0.0, 1.5, "Forward")
+        self._run_motion(-0.2,  0.0, 1.5, "Backward")
+        self._run_motion( 0.0, -0.4, 1.0, "Turn right")
+        self._run_motion( 0.0,  0.4, 2.0, "Turn left")
+        self._run_motion( 0.0, -0.4, 1.0, "Centre")
+        self._log("=== Sequence done ===")
+
+    def _wait_lidar(self):
+        self._log("Waiting for LiDAR...")
+        deadline = time.time() + 10.0
+        while True:
+            with self._lock:
+                if self.lidar_ready:              return True
+                if self.mode == self.MODE_MANUAL: return False
+            if time.time() > deadline:
+                self._log("LiDAR timeout — continuing"); return True
+            time.sleep(0.1)
+
+    # ── Waypoint navigation ───────────────────────────────────────────────────
+
+    def _drive_to_waypoints(self):
+        """
+        Drives to each waypoint in nearest-first order.
+        Runs in the control loop thread via WAYPOINT phase.
+        Uses SLAM TF for pose — map -> base_link.
+        """
+        if not self.waypoints:
+            self._log("No waypoints to drive to!")
+            with self._lock:
+                self.auto_phase = "IDLE"
+            return
+
+        self._log(f"Starting waypoint navigation — {len(self.waypoints)} waypoints")
+        self.visited = [False] * len(self.waypoints)
+
+        while True:
+            # Check mode
+            with self._lock:
+                if self.mode == self.MODE_MANUAL:
+                    self._log("Waypoint navigation aborted — manual mode")
+                    return
+
+            # Update pose from SLAM
+            if not self._update_pose():
+                self._log("WARNING: Cannot get pose from SLAM TF — waiting...")
+                time.sleep(0.5)
+                continue
+
+            # Find nearest unvisited waypoint
+            idx = nearest_unvisited(
+                self.waypoints, self.visited,
+                self.robot_x, self.robot_y
+            )
+
+            if idx == -1:
+                self._log("=== All waypoints reached! ===")
+                self._stop()
+                with self._lock:
+                    self.auto_phase = "IDLE"
+                return
+
+            wx, wy = self.waypoints[idx]
+            self.current_wp_idx = idx
+            self._log(
+                f"Navigating to WP{idx+1} ({wx:.2f}, {wy:.2f}) — "
+                f"robot at ({self.robot_x:.2f}, {self.robot_y:.2f})"
+            )
+
+            # Drive to this waypoint
+            reached = self._drive_to_single_waypoint(wx, wy)
+
+            if reached:
+                self.visited[idx] = True
+                self._log(f"WP{idx+1} reached! Taking photo...")
+                self._trigger_photo(f"waypoint_{idx+1}")
+                time.sleep(1.0)  # Brief pause at waypoint
+            else:
+                # Mode changed to manual
+                return
+
+    def _drive_to_single_waypoint(self, wx: float, wy: float) -> bool:
+        """
+        Drives to a single waypoint (wx, wy) in map frame.
+        Returns True if reached, False if aborted (manual mode).
+
+        Strategy:
+          1. Rotate to face the waypoint
+          2. Drive forward
+          3. Repeat until within tolerance
+          4. Stop if obstacle, resume when clear
+        """
+        while True:
+            # Check mode
+            with self._lock:
+                if self.mode == self.MODE_MANUAL:
+                    self._stop()
+                    return False
+                obstacle = self.obstacle_ahead
+                joy = self.last_joy
+
+            # Check deadman
+            if joy is None or not self.axis_pressed(joy, self.axis_r2):
+                self._stop()
+                time.sleep(0.05)
+                continue
+
+            # Update pose
+            if not self._update_pose():
+                time.sleep(0.1)
+                continue
+
+            # Check if reached
+            dist = math.hypot(wx - self.robot_x, wy - self.robot_y)
+            if dist < WAYPOINT_TOLERANCE_M:
+                self._stop()
+                return True
+
+            # If obstacle, stop and wait
+            if obstacle:
+                self._stop()
+                time.sleep(0.1)
+                continue
+
+            # Calculate heading to waypoint
+            desired_yaw = math.atan2(
+                wy - self.robot_y,
+                wx - self.robot_x
+            )
+            yaw_error = desired_yaw - self.robot_yaw
+
+            # Normalise yaw error to [-pi, pi]
+            while yaw_error >  math.pi: yaw_error -= 2 * math.pi
+            while yaw_error < -math.pi: yaw_error += 2 * math.pi
+
+            # Proportional controller
+            # If pointing wrong way, rotate first then drive
+            if abs(yaw_error) > math.radians(20):
+                # Rotate towards waypoint
+                ang = ANGULAR_SPEED if yaw_error > 0 else -ANGULAR_SPEED
+                self._send_cmd(lin=0.0, ang=ang)
+            else:
+                # Drive forward with gentle correction
+                ang = max(-ANGULAR_SPEED, min(ANGULAR_SPEED, yaw_error * 1.0))
+                self._send_cmd(lin=FORWARD_SPEED, ang=ang)
+
+            time.sleep(0.05)
+
+    # ── Joy callback ──────────────────────────────────────────────────────────
+
+    def joy_callback(self, msg: Joy):
+        self.last_joy = msg
+        if self.btn_down(msg, self.btn_circle):
+            with self._lock:
+                if self.mode != self.MODE_MANUAL:
+                    self.mode = self.MODE_MANUAL
+                    self.auto_phase = "IDLE"
+                    self._stop()
+                    m = String(); m.data = self.mode
+                    self.mode_pub.publish(m)
+                    self._log("MANUAL mode")
+
+        if self.btn_down(msg, self.btn_x):
+            with self._lock:
+                if self.mode != self.MODE_AUTO:
+                    self.mode = self.MODE_AUTO
+                    self.auto_phase = "WAITING"
+                    self.auto_start_time = time.time()
+                    m = String(); m.data = self.mode
+                    self.mode_pub.publish(m)
+                    self._log("AUTO mode — hold R2, starting in 3s...")
+
+    # ── Control loop ──────────────────────────────────────────────────────────
+
+    def control_loop(self):
+        if self.last_joy is None:
+            self._send_cmd(); return
+
+        joy = self.last_joy
+
+        # ── MANUAL ───────────────────────────────────────────────────────────
+        if self.mode == self.MODE_MANUAL:
+            if not self.axis_pressed(joy, self.axis_l2):
+                self._send_cmd(); return
+            lin = self.apply_deadzone(joy.axes[self.axis_right_y] if self.axis_right_y < len(joy.axes) else 0.0)
+            ang = self.apply_deadzone(joy.axes[self.axis_left_x]  if self.axis_left_x  < len(joy.axes) else 0.0)
+            self._send_cmd(self.max_linear * lin, self.max_angular * ang)
+            return
+
+        # ── AUTO ─────────────────────────────────────────────────────────────
+        if self.mode == self.MODE_AUTO:
+            if not self.axis_pressed(joy, self.axis_r2):
+                self._send_cmd(); return
+
+            with self._lock:
+                phase    = self.auto_phase
+                obstacle = self.obstacle_ahead
+
+            if phase == "WAITING":
+                with self._lock:
+                    elapsed = time.time() - self.auto_start_time
+                if elapsed >= STARTUP_DELAY_S:
+                    with self._lock:
+                        self.auto_phase = "SEQUENCE"
+                    self._run_sequence()
+                    if self._wait_lidar():
+                        with self._lock:
+                            self.auto_phase = "WAYPOINT"
+                        # Run waypoint navigation in this thread
+                        # (ReentrantCallbackGroup allows this)
+                        self._drive_to_waypoints()
+
+            elif phase == "SEQUENCE":
+                pass
+
+            elif phase == "WAYPOINT":
+                # _drive_to_waypoints runs blocking in this thread
+                pass
+
+            elif phase == "DRIVING":
+                # Simple forward drive (fallback if no waypoints)
+                if obstacle:
+                    with self._lock:
+                        self.auto_phase = "STOPPED"
+                    self._stop()
+                else:
+                    self._send_cmd(lin=FORWARD_SPEED)
+
+            elif phase == "STOPPED":
+                self._stop()
+                if not obstacle:
+                    with self._lock:
+                        self.auto_phase = "DRIVING"
+                    self._log("Resuming")
+
+            elif phase == "IDLE":
+                self._stop()
+
+    # ── Shutdown ──────────────────────────────────────────────────────────────
+
+    def destroy_node(self):
+        self._stop()
+        if self.pipeline is not None:
+            try:
+                self.pipeline.stop()
+            except Exception as e:
+                self.get_logger().warn(f"Camera pipeline stop failed: {e}")
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DualShockModeTeleop()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node._stop()
+        node.destroy_node()
+        try: rclpy.shutdown()
+        except: pass
+
+if __name__ == "__main__":
+    main()
