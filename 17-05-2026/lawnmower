@@ -1,0 +1,907 @@
+#!/usr/bin/env python3
+"""
+autobot_roll.py — Pioneer 3-AT lawnmower with obstacle avoidance
+=================================================================
+Features
+--------
+  ✓ 5 × 5 m lawnmower coverage (1 m strip spacing)
+  ✓ LiDAR obstacle stop at OBSTACLE_STOP_M (default 1.0 m)
+  ✓ OAK-D camera photo capture on obstacle detection
+  ✓ Bounds-aware bypass: checks which side stays inside the 5 × 5 field
+  ✓ CSV logging  → /root/ros2_autobot/obstacles.csv
+  ✓ Foxglove MarkerArray → /obstacle_markers  (orange spheres, persist forever)
+  ✓ Manual (hold L2) / Auto (press X) DualShock control
+"""
+
+import csv
+import math
+import os
+import threading
+import time
+from typing import Optional, Tuple
+
+import rclpy
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from sensor_msgs.msg import Image, Joy, LaserScan
+from std_msgs.msg import String
+from visualization_msgs.msg import Marker, MarkerArray
+
+from cv_bridge import CvBridge
+import cv2
+
+try:
+    import depthai as dai
+    DEPTHAI_AVAILABLE = True
+except ImportError:
+    DEPTHAI_AVAILABLE = False
+
+# ─────────────────────────── Tunables ────────────────────────────────────────
+AREA_SIZE             = 5.0           # m — field side length
+FIELD_HALF            = AREA_SIZE / 2.0
+STRIP_WIDTH           = 1.0           # m — spacing between parallel passes
+
+AUTO_LINEAR_SPEED     = 0.5           # m/s forward speed in auto
+MANUAL_LINEAR_SPEED   = 0.5
+MANUAL_ANGULAR_SPEED  = 1.2
+
+TURN_SPEED_MAX        = 0.8           # rad/s
+STARTUP_DELAY_S       = 3.0           # seconds after X press before mission starts
+
+CONTROL_DT            = 0.03          # seconds — main loop sleep
+ANGLE_TOL_RAD         = math.radians(2.0)
+BOUND_MARGIN_M        = 0.20          # warn-only bounds margin
+
+# Obstacle detection
+OBSTACLE_STOP_M       = 1.0           # m — stop when obstacle closer than this
+CHASSIS_MIN_M         = 0.30          # m — ignore returns closer (chassis noise)
+FORWARD_CONE_DEG      = 60.0          # total cone width for forward detection
+OBSTACLE_COOLDOWN_S   = 4.0           # min seconds between separate obstacle events
+
+# Bypass geometry  (U-shape detour)
+BYPASS_WIDTH_M        = 1.2           # m — lateral step past obstacle
+BYPASS_FORWARD_M      = 2.5           # m — forward step to clear obstacle body
+
+# Output paths
+CAMERA_SAVE_DIR       = "/root/ros2_autobot/photos"
+OBSTACLE_CSV_PATH     = "/root/ros2_autobot/obstacles.csv"
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class DualShockModeTeleop(Node):
+    # Modes
+    MODE_MANUAL = "manual"
+    MODE_AUTO   = "auto"
+
+    # Auto phases
+    PHASE_IDLE      = "IDLE"
+    PHASE_WAITING   = "WAITING"
+    PHASE_RUNNING   = "RUNNING"
+    PHASE_RETURNING = "RETURNING"
+    PHASE_DONE      = "DONE"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Init
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def __init__(self) -> None:
+        super().__init__("dualshock_mode_teleop")
+        self.cb_group = ReentrantCallbackGroup()
+
+        # ── Parameters ────────────────────────────────────────────────────────
+        self.declare_parameter("btn_x",           0)
+        self.declare_parameter("btn_circle",      1)
+        self.declare_parameter("axis_left_x",     0)
+        self.declare_parameter("axis_right_y",    3)
+        self.declare_parameter("axis_l2",         4)
+        self.declare_parameter("axis_r2",         5)
+        self.declare_parameter("deadzone",        0.10)
+        self.declare_parameter("publish_rate_hz", 20.0)
+
+        self.btn_x            = int(self.get_parameter("btn_x").value)
+        self.btn_circle       = int(self.get_parameter("btn_circle").value)
+        self.axis_left_x      = int(self.get_parameter("axis_left_x").value)
+        self.axis_right_y     = int(self.get_parameter("axis_right_y").value)
+        self.axis_l2          = int(self.get_parameter("axis_l2").value)
+        self.axis_r2          = int(self.get_parameter("axis_r2").value)
+        self.deadzone         = float(self.get_parameter("deadzone").value)
+        self.publish_rate_hz  = float(self.get_parameter("publish_rate_hz").value)
+
+        # ── Thread lock & shared state ─────────────────────────────────────────
+        self._lock              = threading.Lock()
+        self._camera_lock       = threading.Lock()
+
+        self.mode               = self.MODE_MANUAL
+        self.auto_phase         = self.PHASE_IDLE
+        self.auto_start_time    = 0.0
+        self.auto_thread_started = False
+        self.last_joy: Optional[Joy] = None
+
+        # Odometry
+        self.odom_ready         = False
+        self.odom_x             = 0.0
+        self.odom_y             = 0.0
+        self.odom_yaw           = 0.0
+
+        # Mission home (set when AUTO starts)
+        self.home_x             = 0.0
+        self.home_y             = 0.0
+        self.home_yaw           = 0.0
+
+        # LiDAR
+        self.lidar_ready        = False
+        self.obstacle_ahead     = False
+        self._bypass_active     = False   # suppresses obstacle check during bypass
+        self._last_obstacle_t   = 0.0
+
+        # Logging throttles
+        self._last_drive_log_t  = 0.0
+        self._last_bound_warn_t = 0.0
+
+        # Counters
+        self.photo_count        = 0
+        self.obstacle_count     = 0
+        self._marker_list: list = []      # accumulate all markers for republish
+
+        # Camera
+        self.camera_ready       = False
+        self.pipeline           = None
+        self.q_rgb              = None
+        self.bridge             = CvBridge()
+
+        # ── Publishers ──────────────────────────────────────────────────────────
+        self.cmd_pub    = self.create_publisher(Twist,       "/cmd_vel",           10)
+        self.mode_pub   = self.create_publisher(String,      "/control_mode",      10)
+        self.status_pub = self.create_publisher(String,      "/robot_status",      10)
+        self.image_pub  = self.create_publisher(Image,       "/oak/rgb/image_raw", 10)
+        self.marker_pub = self.create_publisher(MarkerArray, "/obstacle_markers",  10)
+
+        # ── Subscriptions ───────────────────────────────────────────────────────
+        self.create_subscription(
+            Joy,       "/joy",  self.joy_callback,   10, callback_group=self.cb_group)
+        self.create_subscription(
+            Odometry,  "/odom", self.odom_callback,  10, callback_group=self.cb_group)
+        self.create_subscription(
+            LaserScan, "/scan", self.lidar_callback, 10, callback_group=self.cb_group)
+        self.create_timer(
+            1.0 / self.publish_rate_hz, self.control_loop, callback_group=self.cb_group)
+
+        # ── Subsystem init ──────────────────────────────────────────────────────
+        self._init_csv()
+        self._init_camera()
+
+        self._log("Autobot ready | MANUAL: hold L2 drive | AUTO: press X to start")
+        self._log(f"LiDAR stop distance: {OBSTACLE_STOP_M}m | Field: {AREA_SIZE}×{AREA_SIZE}m")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CSV initialisation
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _init_csv(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(OBSTACLE_CSV_PATH), exist_ok=True)
+            if not os.path.exists(OBSTACLE_CSV_PATH):
+                with open(OBSTACLE_CSV_PATH, "w", newline="") as f:
+                    csv.writer(f).writerow([
+                        "id", "timestamp",
+                        "odom_x", "odom_y",
+                        "field_x", "field_y",
+                        "photo_file",
+                    ])
+            self._log(f"CSV ready: {OBSTACLE_CSV_PATH}")
+        except Exception as e:
+            self._log(f"WARNING: CSV init failed: {e}")
+
+    def _log_obstacle_csv(self, obs_x: float, obs_y: float,
+                          fx: float, fy: float, photo: str) -> None:
+        try:
+            with open(OBSTACLE_CSV_PATH, "a", newline="") as f:
+                csv.writer(f).writerow([
+                    self.obstacle_count,
+                    time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    f"{obs_x:.4f}", f"{obs_y:.4f}",
+                    f"{fx:.4f}",    f"{fy:.4f}",
+                    photo,
+                ])
+            self._log(f"CSV #{self.obstacle_count}: "
+                      f"odom=({obs_x:.2f},{obs_y:.2f})  "
+                      f"field=({fx:.2f},{fy:.2f})")
+        except Exception as e:
+            self._log(f"WARNING: CSV write failed: {e}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Foxglove marker publishing
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _publish_obstacle_marker(self, obs_x: float, obs_y: float) -> None:
+        """
+        Publish an orange sphere + text label at the obstacle position.
+        All previous markers are re-published so Foxglove keeps them all.
+        """
+        stamp = self.get_clock().now().to_msg()
+
+        # Orange sphere
+        sphere = Marker()
+        sphere.header.frame_id = "odom"
+        sphere.header.stamp    = stamp
+        sphere.ns              = "obstacle_spheres"
+        sphere.id              = self.obstacle_count
+        sphere.type            = Marker.SPHERE
+        sphere.action          = Marker.ADD
+        sphere.pose.position.x = obs_x
+        sphere.pose.position.y = obs_y
+        sphere.pose.position.z = 0.25
+        sphere.pose.orientation.w = 1.0
+        sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.40
+        sphere.color.r = 1.0
+        sphere.color.g = 0.35
+        sphere.color.b = 0.0
+        sphere.color.a = 0.9
+        sphere.lifetime.sec = 0   # persist forever
+
+        # Text label (#N above sphere)
+        label = Marker()
+        label.header.frame_id = "odom"
+        label.header.stamp    = stamp
+        label.ns              = "obstacle_labels"
+        label.id              = self.obstacle_count
+        label.type            = Marker.TEXT_VIEW_FACING
+        label.action          = Marker.ADD
+        label.pose.position.x = obs_x
+        label.pose.position.y = obs_y
+        label.pose.position.z = 0.70
+        label.pose.orientation.w = 1.0
+        label.scale.z         = 0.22
+        label.color.r = label.color.g = label.color.b = label.color.a = 1.0
+        label.text            = f"#{self.obstacle_count}"
+        label.lifetime.sec    = 0
+
+        self._marker_list.extend([sphere, label])
+
+        ma = MarkerArray()
+        ma.markers = self._marker_list
+        self.marker_pub.publish(ma)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Camera
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _init_camera(self) -> None:
+        if not DEPTHAI_AVAILABLE:
+            self._log("WARNING: depthai not installed — camera disabled")
+            return
+        try:
+            os.makedirs(CAMERA_SAVE_DIR, exist_ok=True)
+            self.pipeline = dai.Pipeline()
+            cam = self.pipeline.create(dai.node.Camera).build(
+                dai.CameraBoardSocket.CAM_A
+            )
+            video_out = cam.requestOutput(
+                (1920, 1080), type=dai.ImgFrame.Type.BGR888p
+            )
+            self.q_rgb = video_out.createOutputQueue()
+            self.pipeline.start()
+            self.camera_ready = True
+            self._log(f"OAK-D camera ready → {CAMERA_SAVE_DIR}")
+        except Exception as e:
+            self.camera_ready = False
+            self._log(f"WARNING: OAK-D camera init failed: {e}")
+
+    def _get_frame(self):
+        """Non-blocking single frame grab."""
+        if not self.camera_ready or self.q_rgb is None:
+            return None
+        try:
+            pkt = self.q_rgb.tryGet()
+            return pkt.getCvFrame() if pkt else None
+        except Exception as e:
+            self._log(f"Camera frame error: {e}")
+            return None
+
+    def _capture_photo(self, obs_id: int) -> str:
+        """
+        Blocking call (≤1.5 s). Captures, saves and publishes one frame.
+        Returns the filename (basename) or '' on failure.
+        """
+        with self._camera_lock:
+            if not self.camera_ready:
+                self._log("Camera not ready — skipping photo")
+                return ""
+
+            frame = None
+            deadline = time.time() + 1.5
+            while time.time() < deadline:
+                frame = self._get_frame()
+                if frame is not None:
+                    break
+                time.sleep(0.05)
+
+            if frame is None:
+                self._log("No camera frame available")
+                return ""
+
+            # Publish to Foxglove
+            img_msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
+            img_msg.header.stamp = self.get_clock().now().to_msg()
+            self.image_pub.publish(img_msg)
+
+            # Save to disk
+            self.photo_count += 1
+            ts       = time.strftime("%Y%m%d_%H%M%S")
+            basename = f"obstacle_{obs_id:03d}_{ts}.jpg"
+            path     = os.path.join(CAMERA_SAVE_DIR, basename)
+            try:
+                if cv2.imwrite(path, frame):
+                    self._log(f"Photo saved: {path}")
+                    return basename
+                self._log(f"WARNING: cv2.imwrite failed: {path}")
+            except Exception as e:
+                self._log(f"Photo save error: {e}")
+            return ""
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Generic helpers
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _log(self, msg: str) -> None:
+        self.get_logger().info(msg)
+        s = String()
+        s.data = msg
+        self.status_pub.publish(s)
+
+    def _send_cmd(self, lin: float = 0.0, ang: float = 0.0) -> None:
+        t = Twist()
+        t.linear.x  = float(lin)
+        t.angular.z = float(ang)
+        self.cmd_pub.publish(t)
+
+    def _stop(self) -> None:
+        self._send_cmd(0.0, 0.0)
+
+    @staticmethod
+    def _norm_angle(a: float) -> float:
+        return math.atan2(math.sin(a), math.cos(a))
+
+    def _apply_deadzone(self, v: float) -> float:
+        return 0.0 if abs(v) < self.deadzone else v
+
+    def _axis_pressed(self, joy: Joy, idx: int, threshold: float = 0.5) -> bool:
+        return len(joy.axes) > idx and joy.axes[idx] < threshold
+
+    def _btn_down(self, joy: Joy, idx: int) -> bool:
+        return len(joy.buttons) > idx and joy.buttons[idx] == 1
+
+    def _drive_log(self, text: str) -> None:
+        now = time.time()
+        if now - self._last_drive_log_t >= 0.5:
+            self._last_drive_log_t = now
+            fx, fy = self._field_xy()
+            self._log(f"{text} | field=({fx:.2f},{fy:.2f}) "
+                      f"yaw={math.degrees(self.odom_yaw):.1f}°")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Odometry + coordinate transforms
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def odom_callback(self, msg: Odometry) -> None:
+        self.odom_x = msg.pose.pose.position.x
+        self.odom_y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.odom_yaw = math.atan2(siny, cosy)
+        if not self.odom_ready:
+            self.odom_ready = True
+            self._log(f"Odom ready: ({self.odom_x:.2f},{self.odom_y:.2f}) "
+                      f"yaw={math.degrees(self.odom_yaw):.1f}°")
+
+    def _set_mission_home(self) -> None:
+        self.home_x   = self.odom_x
+        self.home_y   = self.odom_y
+        self.home_yaw = self.odom_yaw
+        self._log(f"Mission home set: ({self.home_x:.2f},{self.home_y:.2f}) "
+                  f"yaw={math.degrees(self.home_yaw):.1f}°")
+
+    def _world_to_field(self, wx: float, wy: float) -> Tuple[float, float]:
+        """Convert world (odom) coordinates to field-relative frame."""
+        dx =  wx - self.home_x
+        dy =  wy - self.home_y
+        c  =  math.cos(self.home_yaw)
+        s  =  math.sin(self.home_yaw)
+        fx =  c * dx + s * dy
+        fy = -s * dx + c * dy
+        return fx, fy
+
+    def _field_xy(self) -> Tuple[float, float]:
+        return self._world_to_field(self.odom_x, self.odom_y)
+
+    def _outside_bounds(self) -> bool:
+        fx, fy = self._field_xy()
+        lim = FIELD_HALF + BOUND_MARGIN_M
+        return abs(fx) > lim or abs(fy) > lim
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # LiDAR callback
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def lidar_callback(self, msg: LaserScan) -> None:
+        if not self.lidar_ready:
+            self.lidar_ready = True
+            self._log(f"LiDAR ready — {len(msg.ranges)} rays, "
+                      f"range [{msg.range_min:.2f}, {msg.range_max:.2f}] m")
+
+        half_cone = math.radians(FORWARD_CONE_DEG / 2.0)
+        found = False
+        for i, r in enumerate(msg.ranges):
+            angle = msg.angle_min + i * msg.angle_increment
+            if abs(angle) > half_cone:
+                continue
+            if not math.isfinite(r):
+                continue
+            if r > msg.range_max:
+                continue
+            if r < CHASSIS_MIN_M:
+                continue
+            if r < OBSTACLE_STOP_M:
+                found = True
+                break
+
+        with self._lock:
+            self.obstacle_ahead = found
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Motion primitives
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _turn_to_yaw(self, target_yaw: float) -> bool:
+        """Spin in place to target_yaw. Returns False if switched to MANUAL."""
+        stable = 0
+        while True:
+            with self._lock:
+                if self.mode == self.MODE_MANUAL:
+                    self._stop()
+                    self._log("Turn aborted — MANUAL")
+                    return False
+
+            err = self._norm_angle(target_yaw - self.odom_yaw)
+            if abs(err) < ANGLE_TOL_RAD:
+                stable += 1
+                if stable >= 5:
+                    self._stop()
+                    return True
+            else:
+                stable = 0
+
+            raw = 1.8 * err
+            mag = min(TURN_SPEED_MAX, max(0.18, abs(raw)))
+            self._send_cmd(0.0, math.copysign(mag, raw))
+            time.sleep(CONTROL_DT)
+
+    def _turn_relative(self, degrees: float) -> bool:
+        target = self._norm_angle(self.odom_yaw + math.radians(degrees))
+        self._log(f"TURN {degrees:+.1f}°")
+        return self._turn_to_yaw(target)
+
+    def _drive_forward(self, distance_m: float,
+                       obstacle_aware: bool = True) -> bool:
+        """
+        Drive forward distance_m metres.
+
+        obstacle_aware=True  → checks LiDAR; on obstacle triggers full
+                               handle→bypass→continue cycle.
+        obstacle_aware=False → used internally during bypass manoeuvre;
+                               ignores obstacle detection.
+
+        Returns True on completion, False if aborted to MANUAL.
+        """
+        if distance_m <= 0.0:
+            return True
+
+        start_x  = self.odom_x
+        start_y  = self.odom_y
+        hold_yaw = self.odom_yaw
+        self._log(f"DRIVE {distance_m:.2f} m  obs_aware={obstacle_aware}")
+
+        while True:
+            with self._lock:
+                if self.mode == self.MODE_MANUAL:
+                    self._stop()
+                    self._log("Drive aborted — MANUAL")
+                    return False
+                obstacle = (self.obstacle_ahead
+                            and obstacle_aware
+                            and not self._bypass_active)
+
+            travelled = math.hypot(self.odom_x - start_x,
+                                   self.odom_y - start_y)
+            self._drive_log(f"DRIVE remain={max(0.0,distance_m-travelled):.2f}m")
+
+            # ── Target reached ────────────────────────────────────────────
+            if travelled >= distance_m - 0.02:
+                self._stop()
+                self._log(f"DRIVE complete: {travelled:.2f} m")
+                return True
+
+            # ── Obstacle detected ─────────────────────────────────────────
+            if obstacle:
+                now = time.time()
+                if now - self._last_obstacle_t >= OBSTACLE_COOLDOWN_S:
+                    self._last_obstacle_t = now
+                    self._stop()
+
+                    if not self._handle_obstacle(hold_yaw):
+                        return False
+
+                    # After bypass, project progress onto original heading
+                    # and continue only the remaining distance.
+                    dx = self.odom_x - start_x
+                    dy = self.odom_y - start_y
+                    progress  = (dx * math.cos(hold_yaw)
+                                 + dy * math.sin(hold_yaw))
+                    remaining = max(0.0, distance_m - progress)
+
+                    if remaining < 0.05:
+                        return True
+
+                    # Continue the pass (re-enter with reduced distance)
+                    self._log(f"Resuming pass: {remaining:.2f} m remaining")
+                    return self._drive_forward(remaining, obstacle_aware=True)
+
+            # ── Bounds warning ────────────────────────────────────────────
+            if self._outside_bounds():
+                now = time.time()
+                if now - self._last_bound_warn_t > 1.0:
+                    self._last_bound_warn_t = now
+                    fx, fy = self._field_xy()
+                    self._log(f"BOUND WARN field=({fx:.2f},{fy:.2f})")
+
+            # ── Normal forward drive with heading hold ────────────────────
+            yaw_err = self._norm_angle(hold_yaw - self.odom_yaw)
+            ang     = max(-0.8, min(0.8, 2.0 * yaw_err))
+            self._send_cmd(AUTO_LINEAR_SPEED, ang)
+            time.sleep(CONTROL_DT)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Obstacle handling — photo + log + bypass
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _handle_obstacle(self, hold_yaw: float) -> bool:
+        """
+        Called when an obstacle is freshly detected.
+          1. Increment counter.
+          2. Estimate obstacle world position.
+          3. Capture photo (blocks ≤ 1.5 s).
+          4. Write CSV row.
+          5. Publish Foxglove marker.
+          6. Execute bypass.
+        Returns True if bypass succeeded, False if MANUAL abort.
+        """
+        self.obstacle_count += 1
+        self._log(f"══ OBSTACLE #{self.obstacle_count} detected ══")
+
+        # Estimated world position (OBSTACLE_STOP_M ahead along hold_yaw)
+        obs_x = self.odom_x + OBSTACLE_STOP_M * math.cos(hold_yaw)
+        obs_y = self.odom_y + OBSTACLE_STOP_M * math.sin(hold_yaw)
+        fx, fy = self._world_to_field(obs_x, obs_y)
+
+        # 1. Photo
+        photo_name = self._capture_photo(self.obstacle_count)
+
+        # 2. CSV
+        self._log_obstacle_csv(obs_x, obs_y, fx, fy, photo_name)
+
+        # 3. Foxglove marker
+        self._publish_obstacle_marker(obs_x, obs_y)
+
+        # 4. Bypass
+        return self._bypass_obstacle(hold_yaw)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Bypass direction selection
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _choose_bypass_direction(self, hold_yaw: float) -> float:
+        """
+        Returns +90.0 (bypass left) or -90.0 (bypass right).
+
+        Logic
+        -----
+        The robot is heading along hold_yaw.
+          Left unit vector  = (-sin(hold_yaw),  cos(hold_yaw))
+          Right unit vector = ( sin(hold_yaw), -cos(hold_yaw))
+
+        We project BYPASS_WIDTH_M in each direction and compute the resulting
+        field_y (lateral offset from home).  The direction that keeps the robot
+        inside [−FIELD_HALF, +FIELD_HALF] wins.  If both or neither are safe,
+        we pick whichever has more clearance.
+        """
+        safe_lim = FIELD_HALF - BOUND_MARGIN_M
+
+        def projected_fy(sign: float) -> float:
+            # sign = +1 → left,  -1 → right
+            nx = self.odom_x + sign * (-math.sin(hold_yaw)) * BYPASS_WIDTH_M
+            ny = self.odom_y + sign * ( math.cos(hold_yaw)) * BYPASS_WIDTH_M
+            _, fy_proj = self._world_to_field(nx, ny)
+            return fy_proj
+
+        fy_left  = projected_fy(+1.0)
+        fy_right = projected_fy(-1.0)
+
+        left_ok  = abs(fy_left)  <= safe_lim
+        right_ok = abs(fy_right) <= safe_lim
+
+        if left_ok and not right_ok:
+            chosen, reason = +90.0, "left (right OOB)"
+        elif right_ok and not left_ok:
+            chosen, reason = -90.0, "right (left OOB)"
+        else:
+            # Both safe or both risky — pick the side with more clearance
+            left_margin  = safe_lim - abs(fy_left)
+            right_margin = safe_lim - abs(fy_right)
+            if left_margin >= right_margin:
+                chosen, reason = +90.0, "left (more margin)"
+            else:
+                chosen, reason = -90.0, "right (more margin)"
+
+        self._log(f"Bypass direction: {reason}  "
+                  f"fy_left={fy_left:.2f}  fy_right={fy_right:.2f}  "
+                  f"safe_lim=±{safe_lim:.2f}")
+        return chosen
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Bypass manoeuvre
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _bypass_obstacle(self, hold_yaw: float) -> bool:
+        """
+        U-shaped detour:
+          1. Turn sideways (±90°)
+          2. Drive BYPASS_WIDTH_M
+          3. Turn back to forward direction
+          4. Drive BYPASS_FORWARD_M  (clear the obstacle)
+          5. Turn back toward original strip
+          6. Drive BYPASS_WIDTH_M  (return to strip)
+          7. Restore original heading
+        All inner drives use obstacle_aware=False to prevent re-triggering.
+        """
+        d = self._choose_bypass_direction(hold_yaw)
+        side = "LEFT" if d > 0 else "RIGHT"
+        self._log(f"BYPASS start → {side}")
+
+        with self._lock:
+            self._bypass_active = True
+        try:
+            steps = [
+                (lambda: self._turn_relative(d),                        f"turn {side}"),
+                (lambda: self._drive_forward(BYPASS_WIDTH_M,  False),   "step sideways"),
+                (lambda: self._turn_relative(-d),                       "turn forward"),
+                (lambda: self._drive_forward(BYPASS_FORWARD_M, False),  "clear obstacle"),
+                (lambda: self._turn_relative(-d),                       "turn back to strip"),
+                (lambda: self._drive_forward(BYPASS_WIDTH_M,  False),   "return to strip"),
+                (lambda: self._turn_relative(d),                        "restore heading"),
+            ]
+            for fn, label in steps:
+                self._log(f"  BYPASS: {label}")
+                if not fn():
+                    self._log("BYPASS aborted — MANUAL")
+                    return False
+        finally:
+            with self._lock:
+                self._bypass_active = False
+
+        self._log("BYPASS complete")
+        return True
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Lawnmower pattern
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _run_lawnmower(self) -> None:
+        """
+        Runs in a background daemon thread.
+
+        Start position: wherever the robot is when X is pressed.
+        The startup sequence positions the robot at the field corner,
+        then sweeps strips back and forth across the 5 × 5 m area.
+        """
+        self._log("═══ AUTO MISSION START ═══")
+        half = FIELD_HALF
+
+        # ── Startup: centre → edge → turn → edge → turn (reach first strip) ──
+        self._log("Startup 1/4: drive to mid-edge")
+        if not self._drive_forward(half):
+            return
+
+        self._log("Startup 2/4: turn left 90°")
+        if not self._turn_relative(90.0):
+            return
+
+        self._log("Startup 3/4: drive to corner")
+        if not self._drive_forward(half):
+            return
+
+        self._log("Startup 4/4: turn left 90° — entering first strip")
+        if not self._turn_relative(90.0):
+            return
+
+        # ── Build strip-shift list ─────────────────────────────────────────
+        shifts: list = []
+        remaining = AREA_SIZE
+        while remaining > 1e-6:
+            step = min(STRIP_WIDTH, remaining)
+            shifts.append(step)
+            remaining -= step
+        num_passes = len(shifts) + 1
+
+        self._log(f"Lawnmower plan: {num_passes} passes, "
+                  f"{len(shifts)} U-turns, strip width={STRIP_WIDTH} m")
+
+        # ── Main mowing loop ───────────────────────────────────────────────
+        for p in range(num_passes):
+            with self._lock:
+                if self.mode == self.MODE_MANUAL:
+                    self._stop()
+                    self._log("Mission aborted — MANUAL")
+                    return
+
+            self._log(f"PASS {p+1}/{num_passes}: {AREA_SIZE:.1f} m forward")
+            if not self._drive_forward(AREA_SIZE):
+                return
+
+            if p < len(shifts):
+                shift = shifts[p]
+                if p % 2 == 0:
+                    # Even pass → LEFT U-turn (turn L, shift, turn L)
+                    self._log(f"  LEFT U-turn: shift {shift:.2f} m")
+                    if not self._turn_relative( 90.0): return
+                    if not self._drive_forward(shift): return
+                    if not self._turn_relative( 90.0): return
+                else:
+                    # Odd pass → RIGHT U-turn (turn R, shift, turn R)
+                    self._log(f"  RIGHT U-turn: shift {shift:.2f} m")
+                    if not self._turn_relative(-90.0): return
+                    if not self._drive_forward(shift): return
+                    if not self._turn_relative(-90.0): return
+
+        # ── Return home ────────────────────────────────────────────────────
+        with self._lock:
+            self.auto_phase = self.PHASE_RETURNING
+        self._log("Coverage complete — returning home")
+
+        dx   = self.home_x - self.odom_x
+        dy   = self.home_y - self.odom_y
+        dist = math.hypot(dx, dy)
+        tyaw = math.atan2(dy, dx)
+
+        self._log(f"RETURN: {dist:.2f} m @ {math.degrees(tyaw):.1f}°")
+        if not self._turn_to_yaw(tyaw):
+            return
+        if not self._drive_forward(dist):
+            return
+
+        self._log(f"HOME. Mission complete. "
+                  f"{self.obstacle_count} obstacle(s) logged.")
+        with self._lock:
+            self.auto_phase = self.PHASE_DONE
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Joy callback
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def joy_callback(self, msg: Joy) -> None:
+        self.last_joy = msg
+
+        # Circle → MANUAL
+        if self._btn_down(msg, self.btn_circle):
+            with self._lock:
+                if self.mode != self.MODE_MANUAL:
+                    self.mode                = self.MODE_MANUAL
+                    self.auto_phase          = self.PHASE_IDLE
+                    self.auto_thread_started = False
+                    self._stop()
+                    m = String(); m.data = self.mode
+                    self.mode_pub.publish(m)
+                    self._log("→ MANUAL mode")
+
+        # X → AUTO
+        if self._btn_down(msg, self.btn_x):
+            with self._lock:
+                if self.auto_phase in (self.PHASE_RUNNING, self.PHASE_RETURNING):
+                    self._log("AUTO already active — ignoring X")
+                else:
+                    self.mode                = self.MODE_AUTO
+                    self.auto_phase          = self.PHASE_WAITING
+                    self.auto_start_time     = time.time()
+                    self.auto_thread_started = False
+                    m = String(); m.data = self.mode
+                    self.mode_pub.publish(m)
+                    self._log(f"→ AUTO in {STARTUP_DELAY_S:.0f} s")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Control loop (timer callback — 20 Hz)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def control_loop(self) -> None:
+        if self.last_joy is None:
+            self._send_cmd()
+            return
+
+        joy = self.last_joy
+
+        # ── MANUAL ──────────────────────────────────────────────────────────
+        if self.mode == self.MODE_MANUAL:
+            if not self._axis_pressed(joy, self.axis_l2):
+                self._send_cmd()   # deadman released → stop
+                return
+            lin = self._apply_deadzone(
+                joy.axes[self.axis_right_y] if self.axis_right_y < len(joy.axes) else 0.0)
+            ang = self._apply_deadzone(
+                joy.axes[self.axis_left_x]  if self.axis_left_x  < len(joy.axes) else 0.0)
+            self._send_cmd(MANUAL_LINEAR_SPEED * lin, MANUAL_ANGULAR_SPEED * ang)
+            return
+
+        # ── AUTO ─────────────────────────────────────────────────────────────
+        if self.mode == self.MODE_AUTO:
+            with self._lock:
+                phase           = self.auto_phase
+                already_started = self.auto_thread_started
+
+            if phase == self.PHASE_WAITING:
+                if (time.time() - self.auto_start_time) < STARTUP_DELAY_S:
+                    return
+                if not self.odom_ready:
+                    self._log("Waiting for odometry…")
+                    return
+                if already_started:
+                    return
+
+                self._set_mission_home()
+                with self._lock:
+                    self.auto_phase          = self.PHASE_RUNNING
+                    self.auto_thread_started = True
+
+                threading.Thread(
+                    target=self._run_lawnmower, daemon=True
+                ).start()
+
+            # RUNNING / RETURNING / DONE — lawnmower thread drives everything
+            # nothing to do here
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Shutdown
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def destroy_node(self) -> None:
+        self._stop()
+        if self.pipeline is not None:
+            try:
+                self.pipeline.stop()
+            except Exception as e:
+                self.get_logger().warn(f"Camera pipeline stop error: {e}")
+        super().destroy_node()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = DualShockModeTeleop()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node._stop()
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
