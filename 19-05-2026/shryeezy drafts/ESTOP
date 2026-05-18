@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+
+import math
+import os
+import time
+from collections import deque
+from typing import Optional
+
+import cv2
+import rclpy
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Twist
+from rclpy.node import Node
+from sensor_msgs.msg import Image, Joy, LaserScan
+from std_msgs.msg import Bool, String
+
+
+class SafetyGateNode(Node):
+    """
+    Safety gate for MOB ROB / Pioneer.
+
+    Mission node publishes:
+        /cmd_vel_raw
+
+    Safety node publishes:
+        /cmd_vel
+
+    If emergency stop triggers:
+        - final /cmd_vel is forced to zero
+        - last 5 seconds of camera are saved
+        - stop is latched
+
+    Press X again:
+        - clears emergency stop
+        - /cmd_vel_raw passes through again
+        - mission continues from where it was
+    """
+
+    def __init__(self):
+        super().__init__("safety_gate_node")
+
+        # ---------------- Parameters ----------------
+
+        self.declare_parameter("cmd_in_topic", "/cmd_vel_raw")
+        self.declare_parameter("cmd_out_topic", "/cmd_vel")
+
+        self.declare_parameter("scan_topic", "/scan")
+        self.declare_parameter("image_topic", "/oak/rgb/image_raw")
+        self.declare_parameter("joy_topic", "/joy")
+        self.declare_parameter("safety_context_topic", "/safety_context")
+
+        self.declare_parameter("btn_x", 0)
+
+        # Emergency stop distance required by project
+        self.declare_parameter("estop_distance_m", 1.0)
+
+        # Robot path corridor
+        self.declare_parameter("robot_half_width_m", 0.30)
+        self.declare_parameter("side_margin_m", 0.20)
+
+        # Only check things in front of robot, not behind
+        self.declare_parameter("front_cone_deg", 70.0)
+
+        # When intentionally approaching a known target,
+        # ignore the very central target cone so you can approach to 0.7 m.
+        self.declare_parameter("approach_ignore_cone_deg", 18.0)
+
+        # Video buffer
+        self.declare_parameter("video_fps", 20.0)
+        self.declare_parameter("pre_event_seconds", 5.0)
+        self.declare_parameter("post_event_seconds", 2.0)
+        self.declare_parameter("save_dir", "/root/ros2_autobot/emergency_events")
+
+        # Closing-speed trigger. This helps detect sudden moving objects.
+        self.declare_parameter("use_closing_speed", True)
+        self.declare_parameter("closing_speed_threshold_mps", 0.35)
+
+        # ---------------- State ----------------
+
+        self.cmd_in_topic = self.get_parameter("cmd_in_topic").value
+        self.cmd_out_topic = self.get_parameter("cmd_out_topic").value
+
+        self.btn_x = int(self.get_parameter("btn_x").value)
+
+        self.estop_distance_m = float(self.get_parameter("estop_distance_m").value)
+        self.robot_half_width_m = float(self.get_parameter("robot_half_width_m").value)
+        self.side_margin_m = float(self.get_parameter("side_margin_m").value)
+        self.front_cone_deg = float(self.get_parameter("front_cone_deg").value)
+        self.approach_ignore_cone_deg = float(
+            self.get_parameter("approach_ignore_cone_deg").value
+        )
+
+        self.video_fps = float(self.get_parameter("video_fps").value)
+        self.pre_event_seconds = float(self.get_parameter("pre_event_seconds").value)
+        self.post_event_seconds = float(self.get_parameter("post_event_seconds").value)
+        self.save_dir = self.get_parameter("save_dir").value
+
+        self.use_closing_speed = bool(self.get_parameter("use_closing_speed").value)
+        self.closing_speed_threshold_mps = float(
+            self.get_parameter("closing_speed_threshold_mps").value
+        )
+
+        os.makedirs(self.save_dir, exist_ok=True)
+
+        self.bridge = CvBridge()
+
+        self.latest_raw_cmd = Twist()
+        self.estop_latched = False
+        self.estop_reason = ""
+
+        self.safety_context = "UNKNOWN"
+
+        self.latest_scan: Optional[LaserScan] = None
+
+        self.prev_front_min: Optional[float] = None
+        self.prev_scan_time: Optional[float] = None
+
+        self.event_count = 0
+        self.saving_post_event = False
+        self.post_event_until = 0.0
+
+        max_frames = int(self.video_fps * self.pre_event_seconds)
+        self.frame_buffer = deque(maxlen=max_frames)
+
+        self.last_x_state = 0
+
+        # ---------------- ROS I/O ----------------
+
+        self.cmd_pub = self.create_publisher(Twist, self.cmd_out_topic, 10)
+        self.estop_pub = self.create_publisher(Bool, "/emergency_stop_active", 10)
+        self.status_pub = self.create_publisher(String, "/safety_status", 10)
+
+        self.create_subscription(
+            Twist,
+            self.cmd_in_topic,
+            self.cmd_callback,
+            10,
+        )
+
+        self.create_subscription(
+            LaserScan,
+            self.get_parameter("scan_topic").value,
+            self.scan_callback,
+            10,
+        )
+
+        self.create_subscription(
+            Image,
+            self.get_parameter("image_topic").value,
+            self.image_callback,
+            10,
+        )
+
+        self.create_subscription(
+            Joy,
+            self.get_parameter("joy_topic").value,
+            self.joy_callback,
+            10,
+        )
+
+        self.create_subscription(
+            String,
+            self.get_parameter("safety_context_topic").value,
+            self.context_callback,
+            10,
+        )
+
+        self.create_timer(0.02, self.output_loop)
+
+        self._log(
+            "Safety gate ready. Mission should publish /cmd_vel_raw. "
+            "Safety gate publishes final /cmd_vel."
+        )
+
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
+
+    def cmd_callback(self, msg: Twist):
+        self.latest_raw_cmd = msg
+
+    def context_callback(self, msg: String):
+        self.safety_context = msg.data.strip().upper()
+
+    def joy_callback(self, msg: Joy):
+        x_now = 0
+
+        if len(msg.buttons) > self.btn_x:
+            x_now = msg.buttons[self.btn_x]
+
+        rising_edge = x_now == 1 and self.last_x_state == 0
+        self.last_x_state = x_now
+
+        if rising_edge and self.estop_latched:
+            self.estop_latched = False
+            self.estop_reason = ""
+            self._log("Emergency stop cleared by X. Resuming /cmd_vel_raw passthrough.")
+
+    def image_callback(self, msg: Image):
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception as e:
+            self._log(f"Image conversion failed: {e}")
+            return
+
+        self.frame_buffer.append((time.time(), frame.copy()))
+
+        if self.saving_post_event and time.time() >= self.post_event_until:
+            self.saving_post_event = False
+            self._save_event_video()
+
+    def scan_callback(self, msg: LaserScan):
+        self.latest_scan = msg
+
+        emergency, reason, front_min = self._scan_has_emergency_obstacle(msg)
+
+        now = time.time()
+
+        closing_trigger = False
+        closing_speed = 0.0
+
+        if (
+            self.use_closing_speed
+            and self.prev_front_min is not None
+            and self.prev_scan_time is not None
+            and front_min is not None
+        ):
+            dt = max(1e-3, now - self.prev_scan_time)
+            closing_speed = (self.prev_front_min - front_min) / dt
+
+            if (
+                front_min < self.estop_distance_m
+                and closing_speed > self.closing_speed_threshold_mps
+            ):
+                closing_trigger = True
+
+        self.prev_front_min = front_min
+        self.prev_scan_time = now
+
+        if closing_trigger and not self._target_is_expected():
+            emergency = True
+            reason = (
+                f"moving/sudden obstacle: front_min={front_min:.2f} m, "
+                f"closing_speed={closing_speed:.2f} m/s"
+            )
+
+        if emergency and not self.estop_latched:
+            self._trigger_estop(reason)
+
+    # ------------------------------------------------------------------
+    # Safety logic
+    # ------------------------------------------------------------------
+
+    def _scan_has_emergency_obstacle(self, scan: LaserScan):
+        """
+        Returns:
+            emergency: bool
+            reason: str
+            front_min: nearest valid distance in front corridor
+        """
+
+        half_cone = math.radians(self.front_cone_deg / 2.0)
+        ignore_half = math.radians(self.approach_ignore_cone_deg / 2.0)
+
+        corridor_half_width = self.robot_half_width_m + self.side_margin_m
+
+        front_min = None
+
+        for i, r in enumerate(scan.ranges):
+            if not math.isfinite(r):
+                continue
+
+            if r < scan.range_min or r > scan.range_max:
+                continue
+
+            angle = scan.angle_min + i * scan.angle_increment
+
+            if abs(angle) > half_cone:
+                continue
+
+            # Convert scan polar point into robot coordinates.
+            # x is forward, y is sideways.
+            x = r * math.cos(angle)
+            y = r * math.sin(angle)
+
+            if x <= 0.0:
+                continue
+
+            if x > self.estop_distance_m:
+                continue
+
+            if abs(y) > corridor_half_width:
+                continue
+
+            if front_min is None or r < front_min:
+                front_min = r
+
+            # If we are intentionally approaching a target,
+            # allow the central target object to be inside 1 m.
+            if self._target_is_expected() and abs(angle) < ignore_half:
+                continue
+
+            return (
+                True,
+                f"unexpected obstacle in path: range={r:.2f} m, "
+                f"x={x:.2f} m, y={y:.2f} m, context={self.safety_context}",
+                front_min,
+            )
+
+        return False, "", front_min
+
+    def _target_is_expected(self) -> bool:
+        """
+        During approach, the front object is expected.
+        This stops false emergency triggers when deliberately approaching to 0.7 m.
+        """
+
+        return self.safety_context in {
+            "APPROACH_TARGET",
+            "PHOTO_TARGET",
+        }
+
+    def _trigger_estop(self, reason: str):
+        self.estop_latched = True
+        self.estop_reason = reason
+        self.event_count += 1
+
+        self._publish_zero()
+
+        self.saving_post_event = True
+        self.post_event_until = time.time() + self.post_event_seconds
+
+        self._log(f"EMERGENCY STOP #{self.event_count}: {reason}")
+        self._log(
+            f"Saving previous {self.pre_event_seconds:.1f}s "
+            f"+ next {self.post_event_seconds:.1f}s video."
+        )
+
+    # ------------------------------------------------------------------
+    # Output gate
+    # ------------------------------------------------------------------
+
+    def output_loop(self):
+        if self.estop_latched:
+            self._publish_zero()
+        else:
+            self.cmd_pub.publish(self.latest_raw_cmd)
+
+        msg = Bool()
+        msg.data = self.estop_latched
+        self.estop_pub.publish(msg)
+
+    def _publish_zero(self):
+        t = Twist()
+        self.cmd_pub.publish(t)
+
+    # ------------------------------------------------------------------
+    # Video saving
+    # ------------------------------------------------------------------
+
+    def _save_event_video(self):
+        if len(self.frame_buffer) == 0:
+            self._log("No frames in buffer, emergency video not saved.")
+            return
+
+        frames = list(self.frame_buffer)
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        filename = f"emergency_{self.event_count:03d}_{ts}.mp4"
+        path = os.path.join(self.save_dir, filename)
+
+        first_frame = frames[0][1]
+        h, w = first_frame.shape[:2]
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(path, fourcc, self.video_fps, (w, h))
+
+        if not writer.isOpened():
+            self._log(f"Failed to open video writer: {path}")
+            return
+
+        for _t, frame in frames:
+            if frame.shape[:2] != (h, w):
+                frame = cv2.resize(frame, (w, h))
+
+            writer.write(frame)
+
+        writer.release()
+
+        self._log(f"Emergency video saved: {path}")
+
+    # ------------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------------
+
+    def _log(self, text: str):
+        self.get_logger().info(text)
+
+        msg = String()
+        msg.data = text
+        self.status_pub.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    node = SafetyGateNode()
+
+    try:
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        node._publish_zero()
+        node.destroy_node()
+
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
