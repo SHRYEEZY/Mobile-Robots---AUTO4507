@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+
+import os
+import time
+
+import cv2
+import depthai as dai
+import rclpy
+from rclpy.node import Node
+
+
+class DepthAIVideoRecorder(Node):
+    def __init__(self):
+        super().__init__("depthai_video_recorder")
+
+        # Parameters
+        self.declare_parameter("save_dir", "/home/shryeezy/depthai_videos")
+        self.declare_parameter("width", 1920)
+        self.declare_parameter("height", 1080)
+        self.declare_parameter("fps", 30.0)
+        self.declare_parameter("show_preview", True)
+
+        self.save_dir = str(self.get_parameter("save_dir").value)
+        self.width = int(self.get_parameter("width").value)
+        self.height = int(self.get_parameter("height").value)
+        self.fps = float(self.get_parameter("fps").value)
+        self.show_preview = bool(self.get_parameter("show_preview").value)
+
+        os.makedirs(self.save_dir, exist_ok=True)
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.video_path = os.path.join(
+            self.save_dir,
+            f"depthai_recording_{timestamp}.mp4"
+        )
+
+        # DepthAI camera setup
+        self.pipeline = dai.Pipeline()
+
+        cam = self.pipeline.create(dai.node.Camera).build(
+            dai.CameraBoardSocket.CAM_A
+        )
+
+        video_out = cam.requestOutput(
+            (self.width, self.height),
+            type=dai.ImgFrame.Type.BGR888p,
+            fps=self.fps
+        )
+
+        self.q_rgb = video_out.createOutputQueue()
+        self.pipeline.start()
+
+        # OpenCV video writer
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+        self.writer = cv2.VideoWriter(
+            self.video_path,
+            fourcc,
+            self.fps,
+            (self.width, self.height)
+        )
+
+        if not self.writer.isOpened():
+            raise RuntimeError(f"Could not open video writer: {self.video_path}")
+
+        self.timer = self.create_timer(
+            1.0 / self.fps,
+            self.record_once
+        )
+
+        self.frame_count = 0
+
+        self.get_logger().info("DepthAI video recorder started")
+        self.get_logger().info(f"Saving video to: {self.video_path}")
+        self.get_logger().info(
+            f"Resolution: {self.width}x{self.height}, FPS: {self.fps}"
+        )
+
+    def record_once(self):
+        try:
+            in_rgb = self.q_rgb.get()
+            frame = in_rgb.getCvFrame()
+        except Exception as e:
+            self.get_logger().error(f"Camera frame failed: {e}")
+            return
+
+        # Safety: make sure frame size matches VideoWriter size
+        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+            frame = cv2.resize(frame, (self.width, self.height))
+
+        # Optional timestamp overlay
+        text = time.strftime("%Y-%m-%d %H:%M:%S")
+        cv2.putText(
+            frame,
+            text,
+            (30, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 0),
+            2
+        )
+
+        self.writer.write(frame)
+        self.frame_count += 1
+
+        if self.frame_count % int(self.fps * 5) == 0:
+            self.get_logger().info(
+                f"Recording... frames saved: {self.frame_count}"
+            )
+
+        if self.show_preview:
+            cv2.imshow("DepthAI Recording", frame)
+            cv2.waitKey(1)
+
+    def destroy_node(self):
+        self.get_logger().info("Stopping recording...")
+
+        try:
+            if self.writer is not None:
+                self.writer.release()
+                self.get_logger().info(f"Video saved: {self.video_path}")
+        except Exception as e:
+            self.get_logger().error(f"Video writer release failed: {e}")
+
+        try:
+            self.pipeline.stop()
+        except Exception:
+            pass
+
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DepthAIVideoRecorder()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
