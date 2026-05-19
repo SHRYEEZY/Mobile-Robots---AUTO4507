@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""
+dual_shock_mode_teleop.py — AUTO4508 Pioneer navigation node.
+
+Pose sources (priority order):
+  1. SLAM map->base_link TF  (most accurate, corrects drift)
+  2. EKF /odom_fused          (odom + IMU — handles grass/slip)
+  3. Raw /odom                (last resort, not used here)
+
+Navigation: Nav2 NavigateToPose action — closed-loop, obstacle-aware.
+  The node sends waypoint goals to Nav2 and monitors result/feedback.
+  _seek_target() is replaced by _nav2_seek_target().
+
+Manual driving, controller buttons, camera, and obstacle photo logic
+are unchanged from the original.
+"""
+
+import math
+import time
+import threading
+import os
+import csv
+from typing import Optional, List, Tuple
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.action import ActionClient
+
+from geometry_msgs.msg import Twist, PoseStamped
+from sensor_msgs.msg import Joy, LaserScan
+from nav_msgs.msg import Odometry
+from std_msgs.msg import String
+from action_msgs.msg import GoalStatus
+from nav2_msgs.action import NavigateToPose
+import tf2_ros
+
+import cv2
+try:
+    import depthai as dai
+    DEPTHAI_AVAILABLE = True
+except ImportError:
+    DEPTHAI_AVAILABLE = False
+
+# ── Configuration Constants ───────────────────────────────────────────────────
+OBSTACLE_DISTANCE_M  = 0.75
+CHASSIS_MIN_RANGE_M  = 0.3
+FORWARD_SPEED        = 0.2       # m/s — passed to Nav2 via params, not used directly
+ANGULAR_SPEED        = 0.4       # rad/s — same
+FORWARD_CONE_DEG     = 30
+WAYPOINT_TOLERANCE_M = 0.5       # metres — must match nav2_params goal_checker xy_goal_tolerance
+SETTLE_TIME_S        = 3.0
+AUTO_START_DELAY_S   = 5.0
+CAMERA_SAVE_DIR      = "/root/auto4508_ws/photos"
+WAYPOINTS_FILE       = "/root/auto4508_ws/src/project1/config/waypoints.txt"
+
+# Nav2 timeouts
+NAV2_READY_TIMEOUT_S = 30.0     # how long to wait for Nav2 action server on startup
+NAV2_GOAL_TIMEOUT_S  = 120.0    # max time Nav2 gets to reach one waypoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def load_waypoints(filepath: str) -> List[Tuple[float, float]]:
+    """Load waypoints from CSV or space-separated text file."""
+    points = []
+    if not os.path.exists(filepath):
+        return points
+    try:
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext == '.csv':
+            with open(filepath, 'r') as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if not row or row[0].strip().startswith('#'):
+                        continue
+                    try:
+                        points.append((float(row[0].strip()), float(row[1].strip())))
+                    except (ValueError, IndexError):
+                        continue
+        else:
+            with open(filepath, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        points.append((float(parts[0]), float(parts[1])))
+    except Exception as e:
+        print(f"Error reading waypoints: {e}")
+    return points
+
+
+class DualShockModeTeleop(Node):
+    MODE_MANUAL = "manual"
+    MODE_AUTO   = "auto"
+
+    def __init__(self) -> None:
+        super().__init__("dualshock_mode_teleop")
+        self.cb_group = ReentrantCallbackGroup()
+
+        self.current_x   = 0.0
+        self.current_y   = 0.0
+        self.current_yaw = 0.0
+        self.pose_valid  = False
+        self._auto_started = False
+
+        self._lock        = threading.Lock()
+        self._camera_lock = threading.Lock()
+        self.mode         = self.MODE_MANUAL
+        self.last_joy: Optional[Joy] = None
+        self.lidar_ready  = False
+        self.obstacle_ahead = False
+        self.auto_phase   = "IDLE"
+        self.photo_count  = 0
+
+        self.camera_ready = False
+        self.pipeline     = None
+        self.q_rgb        = None
+
+        # TF buffer — used for SLAM pose and sending goals in map frame
+        self.tf_buffer   = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # Nav2 action client — replaces _seek_target
+        self._nav2_client = ActionClient(
+            self,
+            NavigateToPose,
+            'navigate_to_pose',
+            callback_group=self.cb_group,
+        )
+        self._current_nav2_goal_handle = None  # track active goal for cancellation
+
+        self.cmd_pub    = self.create_publisher(Twist,  "/cmd_vel",       10)
+        self.mode_pub   = self.create_publisher(String, "/control_mode",  10)
+        self.status_pub = self.create_publisher(String, "/robot_status",  10)
+
+        self.create_subscription(Joy,       "/joy",       self.joy_callback,   10, callback_group=self.cb_group)
+        self.create_subscription(LaserScan, "/scan",      self.lidar_callback, 10, callback_group=self.cb_group)
+        self.create_subscription(Odometry,  "/odom_fused", self.odom_callback, 10, callback_group=self.cb_group)
+        self.create_timer(0.05, self.control_loop,  callback_group=self.cb_group)
+        self.create_timer(AUTO_START_DELAY_S, self._auto_start, callback_group=self.cb_group)
+
+        self._init_camera()
+        self._log(f"DualShock ready — auto starting in {AUTO_START_DELAY_S}s. X=AUTO, O=MANUAL")
+
+    # ── Auto start ────────────────────────────────────────────────────────────
+
+    def _auto_start(self):
+        with self._lock:
+            if self._auto_started:
+                return
+            self._auto_started = True
+            if self.mode != self.MODE_AUTO:
+                self.mode = self.MODE_AUTO
+                self.auto_phase = "RUNNING"
+        self._log("AUTO start — beginning waypoint navigation...")
+        t = threading.Thread(target=self._drive_closest_waypoints, daemon=True)
+        t.start()
+
+    # ── Pose — EKF fused odom+IMU with SLAM TF override ──────────────────────
+
+    def _update_pose_from_slam(self) -> bool:
+        """Try to get pose from SLAM map->base_link TF."""
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                'map', 'base_link',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.1)
+            )
+            with self._lock:
+                self.current_x = tf.transform.translation.x
+                self.current_y = tf.transform.translation.y
+                q = tf.transform.rotation
+                siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+                cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+                self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+                self.pose_valid  = True
+            return True
+        except Exception:
+            return False
+
+    def odom_callback(self, msg: Odometry):
+        """EKF fused odometry — used as fallback when SLAM map->base_link is unavailable."""
+        if not self._update_pose_from_slam():
+            with self._lock:
+                self.current_x = msg.pose.pose.position.x
+                self.current_y = msg.pose.pose.position.y
+                q = msg.pose.pose.orientation
+                siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+                cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+                self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+                self.pose_valid  = True
+
+    def _update_pose(self) -> bool:
+        self._update_pose_from_slam()
+        with self._lock:
+            return self.pose_valid
+
+    # ── LiDAR ────────────────────────────────────────────────────────────────
+
+    def lidar_callback(self, msg: LaserScan):
+        with self._lock:
+            if not self.lidar_ready:
+                self.lidar_ready = True
+                self._log("LiDAR ready.")
+
+        cone_rad = math.radians(FORWARD_CONE_DEG)
+        found = False
+        for i, r in enumerate(msg.ranges):
+            angle = msg.angle_min + i * msg.angle_increment
+            if abs(angle) > cone_rad:               continue
+            if math.isnan(r) or math.isinf(r):     continue
+            if r < CHASSIS_MIN_RANGE_M or r > msg.range_max: continue
+            if r < OBSTACLE_DISTANCE_M:
+                found = True; break
+
+        with self._lock:
+            self.obstacle_ahead = found
+
+    # ── Nav2 goal sending ─────────────────────────────────────────────────────
+
+    def _wait_for_nav2(self) -> bool:
+        """Block until Nav2 action server is available, up to NAV2_READY_TIMEOUT_S."""
+        self._log("Waiting for Nav2 navigate_to_pose action server...")
+        ready = self._nav2_client.wait_for_server(timeout_sec=NAV2_READY_TIMEOUT_S)
+        if ready:
+            self._log("Nav2 action server ready.")
+        else:
+            self._log(f"WARNING: Nav2 not ready after {NAV2_READY_TIMEOUT_S}s — will attempt anyway.")
+        return ready
+
+    def _nav2_seek_target(self, tx: float, ty: float) -> bool:
+        """
+        Send a NavigateToPose goal to Nav2 and block until result.
+
+        Nav2 handles:
+          - Path planning (NavFn on global costmap built from /scan + SLAM map)
+          - Closed-loop control (RegulatedPurePursuit on /odom_fused pose)
+          - Obstacle avoidance via local costmap
+          - Recovery behaviours (spin, back_up) if stuck
+
+        Returns True if goal succeeded (GoalStatus.STATUS_SUCCEEDED).
+        Returns False if cancelled, aborted, or obstacle-stopped by this node.
+        """
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose = PoseStamped()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = tx
+        goal_msg.pose.pose.position.y = ty
+        goal_msg.pose.pose.position.z = 0.0
+        # Heading: face the waypoint from current position
+        with self._lock:
+            cx, cy = self.current_x, self.current_y
+        yaw = math.atan2(ty - cy, tx - cx)
+        goal_msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal_msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+
+        self._log(f"Sending Nav2 goal: ({tx:.3f}, {ty:.3f}) yaw={math.degrees(yaw):.1f}°")
+
+        # Send goal (non-blocking)
+        send_future = self._nav2_client.send_goal_async(goal_msg)
+
+        # Wait for acceptance
+        deadline = time.time() + 10.0
+        while not send_future.done():
+            if time.time() > deadline:
+                self._log("Nav2 goal send timed out.")
+                return False
+            time.sleep(0.05)
+
+        goal_handle = send_future.result()
+        if not goal_handle.accepted:
+            self._log("Nav2 goal rejected.")
+            return False
+
+        with self._lock:
+            self._current_nav2_goal_handle = goal_handle
+
+        self._log("Nav2 goal accepted — navigating...")
+
+        # Request result future
+        result_future = goal_handle.get_result_async()
+
+        # Poll until result or timeout or manual override or obstacle
+        deadline = time.time() + NAV2_GOAL_TIMEOUT_S
+        while not result_future.done():
+            if time.time() > deadline:
+                self._log("Nav2 goal timed out — cancelling.")
+                goal_handle.cancel_goal_async()
+                return False
+
+            with self._lock:
+                manual = (self.mode == self.MODE_MANUAL)
+                obstacle = self.obstacle_ahead
+
+            if manual:
+                self._log("Manual override — cancelling Nav2 goal.")
+                goal_handle.cancel_goal_async()
+                with self._lock:
+                    self._current_nav2_goal_handle = None
+                return False
+
+            if obstacle:
+                # Nav2 local costmap should already be stopping for obstacles,
+                # but if our LiDAR callback sees one, also cancel and take photo.
+                self._log("OBSTACLE detected by node — cancelling Nav2 goal.")
+                goal_handle.cancel_goal_async()
+                self._trigger_photo()
+                with self._lock:
+                    self.mode = self.MODE_MANUAL
+                    self.auto_phase = "IDLE"
+                    self._current_nav2_goal_handle = None
+                return False
+
+            time.sleep(0.1)
+
+        with self._lock:
+            self._current_nav2_goal_handle = None
+
+        result = result_future.result()
+        status = result.status
+
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self._log(f"Nav2 reached ({tx:.3f}, {ty:.3f}) successfully.")
+            return True
+        elif status == GoalStatus.STATUS_CANCELED:
+            self._log("Nav2 goal was cancelled.")
+            return False
+        else:
+            self._log(f"Nav2 goal failed (status={status}).")
+            return False
+
+    # ── Waypoint navigation ───────────────────────────────────────────────────
+
+    def _drive_closest_waypoints(self):
+        waypoints = load_waypoints(WAYPOINTS_FILE)
+        if not waypoints:
+            self._log("No waypoints found.")
+            with self._lock:
+                self.auto_phase = "IDLE"
+            return
+
+        self._log(f"Loaded {len(waypoints)} waypoints — waiting for pose...")
+
+        deadline = time.time() + 15.0
+        while not self._update_pose():
+            if time.time() > deadline:
+                self._log("WARNING: No pose — using (0,0) as start")
+                with self._lock:
+                    self.pose_valid = True
+                break
+            with self._lock:
+                if self.mode == self.MODE_MANUAL:
+                    return
+            time.sleep(0.1)
+
+        slam_available = self._update_pose_from_slam()
+        self._log(f"Position source: {'SLAM (map->base_link)' if slam_available else 'EKF (odom+IMU)'}")
+
+        with self._lock:
+            cx, cy = self.current_x, self.current_y
+            cyaw = self.current_yaw
+
+        self._log(f"Start pose: ({cx:.3f}, {cy:.3f}) yaw: {math.degrees(cyaw):.1f}°")
+        self._log("Distances from start:")
+        for i, (wx, wy) in enumerate(waypoints):
+            d = math.hypot(wx - cx, wy - cy)
+            self._log(f"  WP{i+1} ({wx:.2f}, {wy:.2f}): {d:.2f}m")
+
+        # Wait for Nav2 to be ready before starting
+        self._wait_for_nav2()
+
+        wp_num = 0
+        while len(waypoints) > 0:
+            with self._lock:
+                if self.mode == self.MODE_MANUAL:
+                    self._stop()
+                    return
+
+            self._update_pose()
+            with self._lock:
+                cx, cy = self.current_x, self.current_y
+
+            # Greedy nearest-neighbour selection (unchanged)
+            closest_idx = 0
+            min_dist = math.hypot(waypoints[0][0] - cx, waypoints[0][1] - cy)
+            for idx in range(1, len(waypoints)):
+                d = math.hypot(waypoints[idx][0] - cx, waypoints[idx][1] - cy)
+                if d < min_dist:
+                    min_dist = d
+                    closest_idx = idx
+
+            target_x, target_y = waypoints.pop(closest_idx)
+            wp_num += 1
+            self._log(f"=== WAYPOINT {wp_num}: ({target_x:.2f}, {target_y:.2f}) — {min_dist:.2f}m away ===")
+
+            # Nav2 closed-loop navigation — replaces _seek_target
+            reached = self._nav2_seek_target(target_x, target_y)
+            if not reached:
+                return
+
+            self._stop()
+            self._trigger_photo()
+
+            self._update_pose()
+            with self._lock:
+                fx, fy = self.current_x, self.current_y
+            self._log(f"=== WAYPOINT {wp_num} REACHED! ===")
+            self._log(f"    Target:   ({target_x:.3f}, {target_y:.3f})")
+            self._log(f"    Actual:   ({fx:.3f}, {fy:.3f})")
+            self._log(f"    Error:    {math.hypot(target_x-fx, target_y-fy):.3f}m")
+            self._log(f"    Settling for {SETTLE_TIME_S}s...")
+            time.sleep(SETTLE_TIME_S)
+            self._log(f"    Resuming — {len(waypoints)} waypoints remaining")
+
+        self._log("=== ALL WAYPOINTS COMPLETE ===")
+        with self._lock:
+            self.mode = self.MODE_MANUAL
+            self.auto_phase = "IDLE"
+
+    # ── Joy callback ──────────────────────────────────────────────────────────
+
+    def joy_callback(self, msg: Joy):
+        self.last_joy = msg
+        if self.btn_down(msg, 1):   # O button — manual override
+            with self._lock:
+                self.mode = self.MODE_MANUAL
+                self.auto_phase = "IDLE"
+                self._auto_started = True
+                handle = self._current_nav2_goal_handle
+            # Cancel any active Nav2 goal immediately
+            if handle is not None:
+                handle.cancel_goal_async()
+            self._stop()
+            self._log("MANUAL override")
+
+        if self.btn_down(msg, 0):   # X button — start auto
+            with self._lock:
+                if self.mode != self.MODE_AUTO:
+                    self.mode = self.MODE_AUTO
+                    self.auto_phase = "RUNNING"
+                    self._auto_started = True
+            self._log("AUTO mode triggered manually...")
+            t = threading.Thread(target=self._drive_closest_waypoints, daemon=True)
+            t.start()
+
+    # ── Control loop ──────────────────────────────────────────────────────────
+
+    def control_loop(self):
+        """Manual driving only. In AUTO mode, Nav2 owns /cmd_vel."""
+        if self.last_joy is None:
+            return
+        joy = self.last_joy
+        with self._lock:
+            current_mode = self.mode
+        if current_mode == self.MODE_MANUAL:
+            if len(joy.axes) > 4 and joy.axes[4] < 0.5:
+                lin = joy.axes[3] if len(joy.axes) > 3 else 0.0
+                ang = joy.axes[0] if len(joy.axes) > 0 else 0.0
+                t = Twist()
+                t.linear.x  = 1.0 * lin
+                t.angular.z = 1.0 * ang
+                self.cmd_pub.publish(t)
+
+    # ── Camera ────────────────────────────────────────────────────────────────
+
+    def _init_camera(self):
+        if not DEPTHAI_AVAILABLE:
+            return
+        try:
+            os.makedirs(CAMERA_SAVE_DIR, exist_ok=True)
+            self.pipeline = dai.Pipeline()
+            cam = self.pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+            video_out = cam.requestOutput((1920, 1080), type=dai.ImgFrame.Type.BGR888p)
+            self.q_rgb = video_out.createOutputQueue()
+            self.pipeline.start()
+            self.camera_ready = True
+            self._log(f"Camera ready — saving to {CAMERA_SAVE_DIR}")
+        except Exception as e:
+            self.camera_ready = False
+            self._log(f"Camera failed: {e}")
+
+    def _capture_photo(self):
+        with self._camera_lock:
+            if not self.camera_ready or self.q_rgb is None:
+                return
+            try:
+                in_rgb = self.q_rgb.tryGet()
+                if in_rgb is not None:
+                    self.photo_count += 1
+                    fn = os.path.join(CAMERA_SAVE_DIR, f"waypoint_{self.photo_count:03d}.jpg")
+                    cv2.imwrite(fn, in_rgb.getCvFrame())
+                    self._log(f"Photo saved: {fn}")
+            except Exception as e:
+                self._log(f"Photo error: {e}")
+
+    def _trigger_photo(self):
+        threading.Thread(target=self._capture_photo, daemon=True).start()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _log(self, msg):
+        self.get_logger().info(msg)
+        s = String(); s.data = msg
+        self.status_pub.publish(s)
+
+    def _stop(self):
+        self.cmd_pub.publish(Twist())
+
+    def btn_down(self, joy, idx):
+        return len(joy.buttons) > idx and joy.buttons[idx] == 1
+
+    def destroy_node(self):
+        self._stop()
+        # Cancel any active Nav2 goal on shutdown
+        with self._lock:
+            handle = self._current_nav2_goal_handle
+        if handle is not None:
+            try:
+                handle.cancel_goal_async()
+            except Exception:
+                pass
+        if self.pipeline:
+            try:
+                self.pipeline.stop()
+            except Exception:
+                pass
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DualShockModeTeleop()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node._stop()
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
