@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+
+import math
+import time
+import threading
+import os
+import csv
+from typing import Optional, List, Tuple
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
+
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Joy, LaserScan
+from nav_msgs.msg import Odometry
+from std_msgs.msg import String
+
+import tf2_ros
+
+import cv2
+
+try:
+    import depthai as dai
+    DEPTHAI_AVAILABLE = True
+except ImportError:
+    DEPTHAI_AVAILABLE = False
+
+
+OBSTACLE_DISTANCE_M = 0.75
+CHASSIS_MIN_RANGE_M = 0.3
+
+MAX_LINEAR_SPEED = 0.25
+MAX_ANGULAR_SPEED = 0.6
+
+HEADING_KP = 1.2
+DISTANCE_KP = 0.6
+
+WAYPOINT_TOLERANCE_M = 0.5
+
+SETTLE_TIME_S = 3.0
+AUTO_START_DELAY_S = 5.0
+
+CAMERA_SAVE_DIR = "/root/auto4508_ws/photos"
+WAYPOINTS_FILE = "/root/auto4508_ws/src/project1/config/waypoints.txt"
+
+FORWARD_CONE_DEG = 30
+
+
+def normalize_angle(angle):
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
+
+
+def load_waypoints(filepath: str) -> List[Tuple[float, float]]:
+    points = []
+
+    if not os.path.exists(filepath):
+        return points
+
+    try:
+        ext = os.path.splitext(filepath)[1].lower()
+
+        if ext == '.csv':
+            with open(filepath, 'r') as f:
+                reader = csv.reader(f)
+
+                for row in reader:
+                    if not row or row[0].strip().startswith('#'):
+                        continue
+
+                    try:
+                        points.append(
+                            (float(row[0].strip()), float(row[1].strip()))
+                        )
+                    except:
+                        pass
+        else:
+            with open(filepath, 'r') as f:
+                for line in f:
+                    line = line.strip()
+
+                    if not line or line.startswith('#'):
+                        continue
+
+                    parts = line.split()
+
+                    if len(parts) >= 2:
+                        points.append(
+                            (float(parts[0]), float(parts[1]))
+                        )
+
+    except Exception as e:
+        print(e)
+
+    return points
+
+
+class DualShockModeTeleop(Node):
+
+    MODE_MANUAL = "manual"
+    MODE_AUTO = "auto"
+
+    def __init__(self):
+
+        super().__init__("dualshock_mode_teleop")
+
+        self.cb_group = ReentrantCallbackGroup()
+
+        self.current_x = 0.0
+        self.current_y = 0.0
+        self.current_yaw = 0.0
+
+        self.pose_valid = False
+
+        self._lock = threading.Lock()
+        self._camera_lock = threading.Lock()
+
+        self.mode = self.MODE_MANUAL
+
+        self.last_joy: Optional[Joy] = None
+
+        self.lidar_ready = False
+        self.obstacle_ahead = False
+
+        self.photo_count = 0
+
+        self.camera_ready = False
+        self.pipeline = None
+        self.q_rgb = None
+
+        self._auto_started = False
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(
+            self.tf_buffer,
+            self
+        )
+
+        self.cmd_pub = self.create_publisher(
+            Twist,
+            "/cmd_vel",
+            10
+        )
+
+        self.mode_pub = self.create_publisher(
+            String,
+            "/control_mode",
+            10
+        )
+
+        self.status_pub = self.create_publisher(
+            String,
+            "/robot_status",
+            10
+        )
+
+        self.create_subscription(
+            Joy,
+            "/joy",
+            self.joy_callback,
+            10,
+            callback_group=self.cb_group
+        )
+
+        self.create_subscription(
+            LaserScan,
+            "/scan",
+            self.lidar_callback,
+            10,
+            callback_group=self.cb_group
+        )
+
+        self.create_subscription(
+            Odometry,
+            "/odom_fused",
+            self.odom_callback,
+            10,
+            callback_group=self.cb_group
+        )
+
+        self.create_timer(
+            0.05,
+            self.control_loop,
+            callback_group=self.cb_group
+        )
+
+        self.auto_timer = self.create_timer(
+            AUTO_START_DELAY_S,
+            self._auto_start,
+            callback_group=self.cb_group
+        )
+
+        self._init_camera()
+
+        self._log(
+            f"Ready — auto start in {AUTO_START_DELAY_S}s"
+        )
+
+    def _auto_start(self):
+
+        with self._lock:
+
+            if self._auto_started:
+                return
+
+            self._auto_started = True
+
+            self.auto_timer.cancel()
+
+            self.mode = self.MODE_AUTO
+
+        self._log("AUTO mode started")
+
+        threading.Thread(
+            target=self._drive_closest_waypoints,
+            daemon=True
+        ).start()
+
+    def _update_pose_from_slam(self):
+
+        try:
+
+            tf = self.tf_buffer.lookup_transform(
+                'map',
+                'base_link',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.1)
+            )
+
+            with self._lock:
+
+                self.current_x = tf.transform.translation.x
+                self.current_y = tf.transform.translation.y
+
+                q = tf.transform.rotation
+
+                siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+                cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+
+                self.current_yaw = math.atan2(
+                    siny_cosp,
+                    cosy_cosp
+                )
+
+                self.pose_valid = True
+
+            return True
+
+        except Exception:
+            return False
+
+    def odom_callback(self, msg: Odometry):
+
+        if not self._update_pose_from_slam():
+
+            with self._lock:
+
+                self.current_x = msg.pose.pose.position.x
+                self.current_y = msg.pose.pose.position.y
+
+                q = msg.pose.pose.orientation
+
+                siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+                cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+
+                self.current_yaw = math.atan2(
+                    siny_cosp,
+                    cosy_cosp
+                )
+
+                self.pose_valid = True
+
+    def lidar_callback(self, msg: LaserScan):
+
+        with self._lock:
+
+            if not self.lidar_ready:
+                self.lidar_ready = True
+                self._log("LiDAR ready")
+
+        cone_rad = math.radians(FORWARD_CONE_DEG)
+
+        found = False
+
+        for i, r in enumerate(msg.ranges):
+
+            angle = msg.angle_min + i * msg.angle_increment
+
+            if abs(angle) > cone_rad:
+                continue
+
+            if math.isnan(r) or math.isinf(r):
+                continue
+
+            if r < CHASSIS_MIN_RANGE_M:
+                continue
+
+            if r > msg.range_max:
+                continue
+
+            if r < OBSTACLE_DISTANCE_M:
+                found = True
+                break
+
+        with self._lock:
+            self.obstacle_ahead = found
+
+    def _seek_target(self, tx, ty):
+
+        self._log(f"Driving to ({tx:.2f}, {ty:.2f})")
+
+        while rclpy.ok():
+
+            with self._lock:
+
+                if self.mode == self.MODE_MANUAL:
+                    self._stop()
+                    return False
+
+                cx = self.current_x
+                cy = self.current_y
+                cyaw = self.current_yaw
+
+                obstacle = self.obstacle_ahead
+
+            dx = tx - cx
+            dy = ty - cy
+
+            distance = math.hypot(dx, dy)
+
+            if distance < WAYPOINT_TOLERANCE_M:
+
+                self._stop()
+
+                self._log("Waypoint reached")
+
+                return True
+
+            target_heading = math.atan2(dy, dx)
+
+            heading_error = normalize_angle(
+                target_heading - cyaw
+            )
+
+            cmd = Twist()
+
+            if obstacle:
+
+                cmd.linear.x = 0.0
+                cmd.angular.z = 0.4
+
+            else:
+
+                if abs(heading_error) > 0.4:
+
+                    cmd.linear.x = 0.0
+
+                    cmd.angular.z = max(
+                        -MAX_ANGULAR_SPEED,
+                        min(
+                            MAX_ANGULAR_SPEED,
+                            HEADING_KP * heading_error
+                        )
+                    )
+
+                else:
+
+                    cmd.linear.x = max(
+                        0.05,
+                        min(
+                            MAX_LINEAR_SPEED,
+                            DISTANCE_KP * distance
+                        )
+                    )
+
+                    cmd.angular.z = max(
+                        -MAX_ANGULAR_SPEED,
+                        min(
+                            MAX_ANGULAR_SPEED,
+                            HEADING_KP * heading_error
+                        )
+                    )
+
+            self.cmd_pub.publish(cmd)
+
+            time.sleep(0.05)
+
+        return False
+
+    def _drive_closest_waypoints(self):
+
+        waypoints = load_waypoints(WAYPOINTS_FILE)
+
+        if not waypoints:
+            self._log("No waypoints")
+            return
+
+        self._log(f"Loaded {len(waypoints)} waypoints")
+
+        deadline = time.time() + 15.0
+
+        while not self.pose_valid:
+
+            if time.time() > deadline:
+                self._log("No pose")
+                return
+
+            time.sleep(0.1)
+
+        while len(waypoints) > 0:
+
+            with self._lock:
+
+                cx = self.current_x
+                cy = self.current_y
+
+            closest_idx = 0
+
+            min_dist = math.hypot(
+                waypoints[0][0] - cx,
+                waypoints[0][1] - cy
+            )
+
+            for idx in range(1, len(waypoints)):
+
+                d = math.hypot(
+                    waypoints[idx][0] - cx,
+                    waypoints[idx][1] - cy
+                )
+
+                if d < min_dist:
+                    min_dist = d
+                    closest_idx = idx
+
+            tx, ty = waypoints.pop(closest_idx)
+
+            reached = self._seek_target(tx, ty)
+
+            if not reached:
+                return
+
+            self._stop()
+
+            self._trigger_photo()
+
+            time.sleep(SETTLE_TIME_S)
+
+        self._log("All waypoints complete")
+
+        with self._lock:
+            self.mode = self.MODE_MANUAL
+
+    def joy_callback(self, msg: Joy):
+
+        self.last_joy = msg
+
+        if self.btn_down(msg, 1):
+
+            with self._lock:
+                self.mode = self.MODE_MANUAL
+
+            self._stop()
+
+            self._log("MANUAL mode")
+
+        if self.btn_down(msg, 0):
+
+            with self._lock:
+
+                if self.mode != self.MODE_AUTO:
+
+                    self.mode = self.MODE_AUTO
+
+                    threading.Thread(
+                        target=self._drive_closest_waypoints,
+                        daemon=True
+                    ).start()
+
+            self._log("AUTO mode")
+
+    def control_loop(self):
+
+        if self.last_joy is None:
+            return
+
+        joy = self.last_joy
+
+        with self._lock:
+            mode = self.mode
+
+        if mode == self.MODE_MANUAL:
+
+            if len(joy.axes) > 4 and joy.axes[4] < 0.5:
+
+                lin = joy.axes[3]
+                ang = joy.axes[0]
+
+                t = Twist()
+
+                t.linear.x = lin
+                t.angular.z = ang
+
+                self.cmd_pub.publish(t)
+
+    def _init_camera(self):
+
+        if not DEPTHAI_AVAILABLE:
+            return
+
+        try:
+
+            os.makedirs(CAMERA_SAVE_DIR, exist_ok=True)
+
+            self.pipeline = dai.Pipeline()
+
+            cam = self.pipeline.create(
+                dai.node.Camera
+            ).build(
+                dai.CameraBoardSocket.CAM_A
+            )
+
+            video_out = cam.requestOutput(
+                (1920, 1080),
+                type=dai.ImgFrame.Type.BGR888p
+            )
+
+            self.q_rgb = video_out.createOutputQueue()
+
+            self.pipeline.start()
+
+            self.camera_ready = True
+
+            self._log("Camera ready")
+
+        except Exception as e:
+
+            self.camera_ready = False
+
+            self._log(f"Camera failed: {e}")
+
+    def _capture_photo(self):
+
+        with self._camera_lock:
+
+            if not self.camera_ready:
+                return
+
+            try:
+
+                in_rgb = self.q_rgb.tryGet()
+
+                if in_rgb is not None:
+
+                    self.photo_count += 1
+
+                    fn = os.path.join(
+                        CAMERA_SAVE_DIR,
+                        f"waypoint_{self.photo_count:03d}.jpg"
+                    )
+
+                    cv2.imwrite(
+                        fn,
+                        in_rgb.getCvFrame()
+                    )
+
+                    self._log(f"Saved {fn}")
+
+            except Exception as e:
+
+                self._log(f"Photo error: {e}")
+
+    def _trigger_photo(self):
+
+        threading.Thread(
+            target=self._capture_photo,
+            daemon=True
+        ).start()
+
+    def _log(self, msg):
+
+        self.get_logger().info(msg)
+
+        s = String()
+        s.data = msg
+
+        self.status_pub.publish(s)
+
+    def _stop(self):
+
+        self.cmd_pub.publish(Twist())
+
+    def btn_down(self, joy, idx):
+
+        return (
+            len(joy.buttons) > idx and
+            joy.buttons[idx] == 1
+        )
+
+    def destroy_node(self):
+
+        self._stop()
+
+        if self.pipeline:
+            try:
+                self.pipeline.stop()
+            except:
+                pass
+
+        super().destroy_node()
+
+
+def main(args=None):
+
+    rclpy.init(args=args)
+
+    node = DualShockModeTeleop()
+
+    executor = MultiThreadedExecutor(
+        num_threads=4
+    )
+
+    executor.add_node(node)
+
+    try:
+        executor.spin()
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+
+        node._stop()
+
+        node.destroy_node()
+
+        try:
+            rclpy.shutdown()
+        except:
+            pass
+
+
+if __name__ == "__main__":
+    main()
