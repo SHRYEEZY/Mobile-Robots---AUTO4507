@@ -1,0 +1,1599 @@
+#!/usr/bin/env python3
+"""
+autobot_roll.py — 360 scan + 7.5 m ray-sweep object/waypoint hunter
+===================================================================
+
+Behaviour
+---------
+AUTO mode, press X:
+
+  1. Robot starts at field centre.
+
+  2. Robot rotates in place and scans 360 degrees using LiDAR.
+
+  3. If an object is detected directly ahead during the scan:
+       a. Stop scanning.
+       b. Commit to a full outward ray sweep in that direction.
+       c. Drive OUTWARD_SWEEP_M metres total in that heading.
+       d. During the outward sweep:
+            - if object/waypoint appears:
+                i.   approach to TARGET_STANDOFF_M
+                ii.  take photo
+                iii. detect red/yellow object OR Greek waypoint
+                iv.  log result to CSV
+                v.   bypass the object
+                vi.  continue the outward sweep
+       e. Once OUTWARD_SWEEP_M is reached:
+            - turn 180 degrees
+            - return the same distance toward centre
+            - avoid obstacles on return, but do NOT photo/log new objects
+       f. Correct back to centre if odometry drift/bypass error exists.
+       g. Turn back to original outward heading.
+       h. Continue the 360 scan from there.
+
+  4. Duplicate waypoint labels are counted:
+       beta -> Beta
+       beta again -> Beta2
+       beta again -> Beta3
+
+  5. Red/yellow objects are logged as:
+       OBJECT_RED
+       OBJECT_YELLOW
+
+  6. Unknown non-waypoints are logged as:
+       OBJECT_UNKNOWN
+
+  7. SLAM map is saved at the end if slam_toolbox SaveMap is available.
+
+MANUAL mode:
+  Hold L2 and use sticks.
+  Circle aborts AUTO back to MANUAL.
+
+Important field note
+--------------------
+If OUTWARD_SWEEP_M = 7.5 m from centre, the field should be about 15 x 15 m.
+
+If your real field is 5 x 5 m, set:
+
+    AREA_SIZE = 5.0
+    OUTWARD_SWEEP_M = 2.5
+"""
+
+import csv
+import math
+import os
+import threading
+import time
+from typing import List, Optional, Tuple
+
+import cv2
+import numpy as np
+import rclpy
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from sensor_msgs.msg import Image, Joy, LaserScan
+from std_msgs.msg import String
+
+
+# ── Optional heavy deps ───────────────────────────────────────────────────────
+
+try:
+    from slam_toolbox.srv import SaveMap
+    SLAM_TOOLBOX_AVAILABLE = True
+except ImportError:
+    SLAM_TOOLBOX_AVAILABLE = False
+
+try:
+    import depthai as dai
+    DEPTHAI_AVAILABLE = True
+except ImportError:
+    DEPTHAI_AVAILABLE = False
+
+try:
+    from ultralytics import YOLO
+    ULTRALYTICS_AVAILABLE = True
+except ImportError:
+    ULTRALYTICS_AVAILABLE = False
+
+
+# ─────────────────────────── Tunables ────────────────────────────────────────
+
+# Field
+AREA_SIZE = 15.0
+FIELD_HALF = AREA_SIZE / 2.0
+
+# Ray sweep behaviour
+OUTWARD_SWEEP_M = 7.50
+RETURN_HOME_TOL_M = 0.25
+TARGET_LOG_RADIUS_M = 0.55
+
+# Detection
+MAX_DETECT_RANGE = FIELD_HALF * math.sqrt(2)
+DETECT_CONE_DEG = 20.0
+TARGET_CONE_DEG = 20.0
+CHASSIS_MIN_M = 0.25
+
+# Approach / photo
+TARGET_STANDOFF_M = 0.70
+APPROACH_STANDOFF_M = TARGET_STANDOFF_M
+AUTO_SPEED = 0.35
+
+# Bypass after logging target
+BYPASS_WIDTH_M = 1.20
+BYPASS_FORWARD_M = 1.60
+
+# Rotation
+SCAN_TURN_SPEED = 0.50
+TURN_SPEED_MAX = 0.80
+CONTROL_DT = 0.03
+ANGLE_TOL_RAD = math.radians(2.0)
+
+# Startup
+STARTUP_DELAY_S = 3.0
+
+# Manual
+MANUAL_LINEAR_SPEED = 0.50
+MANUAL_ANGULAR_SPEED = 1.20
+
+# Safety brake
+SAFETY_STOP_M = 0.25
+SAFETY_CONE_DEG = 30.0
+
+# Red/yellow object colour detection
+COLOUR_MIN_AREA_PX = 2500
+COLOUR_MIN_RATIO = 0.015
+
+# Vision tunables
+VISION_CONFIDENCE_THR = 0.70
+VISION_USE_WHITE_CROP = True
+VISION_MIN_INK_RATIO = 0.005
+VISION_MAX_INK_RATIO = 0.35
+VISION_MIN_INK_AREA = 80
+VISION_WHITE_MIN_AREA = 5000
+
+# Model path
+_HERE = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(_HERE, "best.pt")
+
+# Output paths
+FOR_ML_DIR = "/root/ros2_autobot/for_ml"
+BIN_CSV_PATH = "/root/ros2_autobot/for_ml/bin_positions.csv"
+MAP_DIR = "/root/ros2_autobot/maps"
+
+
+class DualShockBinHunt(Node):
+
+    MODE_MANUAL = "manual"
+    MODE_AUTO = "auto"
+
+    PHASE_IDLE = "IDLE"
+    PHASE_WAITING = "WAITING"
+    PHASE_RUNNING = "RUNNING"
+    PHASE_DONE = "DONE"
+
+    def __init__(self) -> None:
+        super().__init__("dualshock_bin_hunt")
+
+        self.cb_group = ReentrantCallbackGroup()
+
+        self.declare_parameter("btn_x", 0)
+        self.declare_parameter("btn_circle", 1)
+        self.declare_parameter("axis_left_x", 0)
+        self.declare_parameter("axis_right_y", 3)
+        self.declare_parameter("axis_l2", 4)
+        self.declare_parameter("deadzone", 0.10)
+        self.declare_parameter("publish_rate_hz", 20.0)
+        # Use EKF output from robot_localization. Your launch remaps
+        # odometry/filtered -> /odom_fused, which fuses /odom + /imu/data.
+        self.declare_parameter("pose_topic", "/odom_fused")
+
+        self.btn_x = int(self.get_parameter("btn_x").value)
+        self.btn_circle = int(self.get_parameter("btn_circle").value)
+        self.axis_left_x = int(self.get_parameter("axis_left_x").value)
+        self.axis_right_y = int(self.get_parameter("axis_right_y").value)
+        self.axis_l2 = int(self.get_parameter("axis_l2").value)
+        self.deadzone = float(self.get_parameter("deadzone").value)
+        self.publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
+        self.pose_topic = str(self.get_parameter("pose_topic").value)
+
+        self._lock = threading.Lock()
+        self._camera_lock = threading.Lock()
+
+        self.mode = self.MODE_MANUAL
+        self.auto_phase = self.PHASE_IDLE
+        self.auto_start_time = 0.0
+        self.auto_thread_started = False
+        self.last_joy: Optional[Joy] = None
+
+        # Fused EKF pose. Variable names stay odom_* so the mission logic below
+        # remains unchanged, but these values now come from /odom_fused by default.
+        self.odom_ready = False
+        self.odom_x = 0.0
+        self.odom_y = 0.0
+        self.odom_yaw = 0.0
+
+        # Mission home
+        self.home_x = 0.0
+        self.home_y = 0.0
+        self.home_yaw = 0.0
+
+        # LiDAR
+        self.lidar_ready = False
+        self.latest_scan: Optional[LaserScan] = None
+        self.safety_obstacle = False
+
+        # Camera
+        self.camera_ready = False
+        self.pipeline = None
+        self.q_rgb = None
+        self.bridge = CvBridge()
+
+        # Mission bookkeeping
+        self.visited_positions: List[Tuple[float, float]] = []
+        self.logged_target_positions: List[Tuple[float, float]] = []
+        self.waypoint_counts = {}
+        self.photo_count = 0
+        self.event_count = 0
+
+        # Publishers
+        self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.mode_pub = self.create_publisher(String, "/control_mode", 10)
+        self.status_pub = self.create_publisher(String, "/robot_status", 10)
+        self.image_pub = self.create_publisher(Image, "/oak/rgb/image_raw", 10)
+
+        # Vision model
+        self.yolo_model = None
+        self._init_vision_model()
+
+        # Subscriptions
+        self.create_subscription(
+            Joy,
+            "/joy",
+            self.joy_callback,
+            10,
+            callback_group=self.cb_group,
+        )
+
+        self.create_subscription(
+            Odometry,
+            self.pose_topic,
+            self.odom_callback,
+            10,
+            callback_group=self.cb_group,
+        )
+
+        self.create_subscription(
+            LaserScan,
+            "/scan",
+            self.lidar_callback,
+            10,
+            callback_group=self.cb_group,
+        )
+
+        # Map save service
+        self.save_map_client = None
+        if SLAM_TOOLBOX_AVAILABLE:
+            os.makedirs(MAP_DIR, exist_ok=True)
+            self.save_map_client = self.create_client(
+                SaveMap,
+                "/slam_toolbox/save_map",
+            )
+
+        self.create_timer(
+            1.0 / self.publish_rate_hz,
+            self.control_loop,
+            callback_group=self.cb_group,
+        )
+
+        self._init_dirs_csv()
+        self._init_camera()
+
+        self._log(
+            f"Bin-hunt 7.5 m ray-sweep ready\n"
+            f"  Pose source:    {self.pose_topic}  (EKF: odom + IMU)\n"
+            f"  Field:          {AREA_SIZE} x {AREA_SIZE} m\n"
+            f"  Outward sweep:  {OUTWARD_SWEEP_M:.2f} m\n"
+            f"  Standoff:       {TARGET_STANDOFF_M:.2f} m\n"
+            f"  Detect cone:    ±{DETECT_CONE_DEG / 2:.0f} deg\n"
+            f"  YOLO model:     {'LOADED' if self.yolo_model else 'UNAVAILABLE'} "
+            f"({MODEL_PATH})\n"
+            f"  MANUAL: hold L2 + stick | AUTO: press X | ABORT: Circle"
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Setup
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _init_dirs_csv(self) -> None:
+        os.makedirs(FOR_ML_DIR, exist_ok=True)
+
+        if not os.path.exists(BIN_CSV_PATH):
+            with open(BIN_CSV_PATH, "w", newline="") as f:
+                csv.writer(f).writerow([
+                    "event_id",
+                    "timestamp",
+
+                    "record_type",
+                    "display_label",
+
+                    "world_x",
+                    "world_y",
+                    "field_x",
+                    "field_y",
+
+                    "range_m",
+                    "heading_deg",
+
+                    "photo_file",
+
+                    "greek_letter",
+                    "letter_confidence",
+                    "colour_class",
+                    "vision_detail",
+                ])
+
+        self._log(f"CSV: {BIN_CSV_PATH}")
+
+    def _init_camera(self) -> None:
+        if not DEPTHAI_AVAILABLE:
+            self._log("WARNING: depthai not installed — camera disabled")
+            return
+
+        try:
+            self.pipeline = dai.Pipeline()
+
+            cam = self.pipeline.create(dai.node.Camera).build(
+                dai.CameraBoardSocket.CAM_A
+            )
+
+            out = cam.requestOutput(
+                (1920, 1080),
+                type=dai.ImgFrame.Type.BGR888p,
+            )
+
+            self.q_rgb = out.createOutputQueue()
+            self.pipeline.start()
+            self.camera_ready = True
+
+            self._log(f"OAK-D camera ready -> {FOR_ML_DIR}")
+
+        except Exception as e:
+            self.camera_ready = False
+            self._log(f"WARNING: OAK-D init failed: {e}")
+
+    def _init_vision_model(self) -> None:
+        if not ULTRALYTICS_AVAILABLE:
+            self._log("WARNING: ultralytics not installed — Greek detection disabled")
+            return
+
+        if not os.path.exists(MODEL_PATH):
+            self._log(f"WARNING: best.pt not found at {MODEL_PATH} — detection disabled")
+            return
+
+        try:
+            self.yolo_model = YOLO(MODEL_PATH)
+            self._log(f"YOLO model loaded: {MODEL_PATH}")
+        except Exception as e:
+            self.yolo_model = None
+            self._log(f"WARNING: YOLO model load failed: {e}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Vision: red/yellow object detection
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _detect_red_yellow_object(self, frame: np.ndarray) -> Tuple[str, float, str]:
+        """
+        Detect obvious red/yellow object colours in the camera frame.
+
+        Returns:
+            colour_class, score, detail
+
+        colour_class:
+            red / yellow / none
+        """
+
+        if frame is None:
+            return "none", 0.0, "No frame for colour detection"
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        red1 = cv2.inRange(hsv, (0, 80, 80), (10, 255, 255))
+        red2 = cv2.inRange(hsv, (170, 80, 80), (180, 255, 255))
+        red_mask = cv2.bitwise_or(red1, red2)
+
+        yellow_mask = cv2.inRange(hsv, (18, 80, 80), (38, 255, 255))
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+
+        yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN, kernel)
+        yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel)
+
+        total_px = frame.shape[0] * frame.shape[1]
+
+        def mask_score(mask):
+            pixels = cv2.countNonZero(mask)
+            ratio = pixels / total_px if total_px > 0 else 0.0
+            contours, _ = cv2.findContours(
+                mask,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
+            max_area = max((cv2.contourArea(c) for c in contours), default=0.0)
+            return pixels, ratio, max_area
+
+        _red_px, red_ratio, red_area = mask_score(red_mask)
+        _yel_px, yellow_ratio, yellow_area = mask_score(yellow_mask)
+
+        red_ok = red_area >= COLOUR_MIN_AREA_PX and red_ratio >= COLOUR_MIN_RATIO
+        yellow_ok = yellow_area >= COLOUR_MIN_AREA_PX and yellow_ratio >= COLOUR_MIN_RATIO
+
+        if red_ok and red_ratio >= yellow_ratio:
+            return (
+                "red",
+                red_ratio,
+                f"Red object detected: ratio={red_ratio:.3f}, area={red_area:.0f}",
+            )
+
+        if yellow_ok:
+            return (
+                "yellow",
+                yellow_ratio,
+                f"Yellow object detected: ratio={yellow_ratio:.3f}, area={yellow_area:.0f}",
+            )
+
+        return (
+            "none",
+            max(red_ratio, yellow_ratio),
+            f"No red/yellow object: red_ratio={red_ratio:.3f}, "
+            f"yellow_ratio={yellow_ratio:.3f}",
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Vision: Greek-letter pipeline
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _crop_white_page(self, frame: np.ndarray):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        lower_white = (0, 0, 150)
+        upper_white = (180, 80, 255)
+
+        mask = cv2.inRange(hsv, lower_white, upper_white)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        if not contours:
+            return None, None, mask
+
+        largest = max(contours, key=cv2.contourArea)
+
+        if cv2.contourArea(largest) < VISION_WHITE_MIN_AREA:
+            return None, None, mask
+
+        x, y, w, h = cv2.boundingRect(largest)
+
+        margin = 20
+
+        x1 = max(0, x - margin)
+        y1 = max(0, y - margin)
+        x2 = min(frame.shape[1], x + w + margin)
+        y2 = min(frame.shape[0], y + h + margin)
+
+        return frame[y1:y2, x1:x2], (x1, y1, x2, y2), mask
+
+    def _has_black_ink(self, crop: np.ndarray):
+        if crop is None or crop.size == 0:
+            return False, 0.0, None
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        _, ink_mask = cv2.threshold(
+            gray_blur,
+            130,
+            255,
+            cv2.THRESH_BINARY_INV,
+        )
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+        ink_mask = cv2.morphologyEx(ink_mask, cv2.MORPH_OPEN, kernel)
+        ink_mask = cv2.morphologyEx(ink_mask, cv2.MORPH_CLOSE, kernel)
+
+        ink_pixels = cv2.countNonZero(ink_mask)
+        total_pixels = crop.shape[0] * crop.shape[1]
+        ink_ratio = ink_pixels / total_pixels if total_pixels > 0 else 0.0
+
+        contours, _ = cv2.findContours(
+            ink_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        max_area = max((cv2.contourArea(c) for c in contours), default=0)
+
+        has_ink = (
+            VISION_MIN_INK_RATIO <= ink_ratio <= VISION_MAX_INK_RATIO
+            and max_area >= VISION_MIN_INK_AREA
+        )
+
+        return has_ink, ink_ratio, ink_mask
+
+    def _extract_ink_roi(self, crop: np.ndarray, ink_mask: np.ndarray) -> np.ndarray:
+        if crop is None or ink_mask is None:
+            return crop
+
+        contours, _ = cv2.findContours(
+            ink_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        good = [c for c in contours if cv2.contourArea(c) >= VISION_MIN_INK_AREA]
+
+        if not good:
+            return crop
+
+        all_pts = np.vstack(good)
+        x, y, w, h = cv2.boundingRect(all_pts)
+
+        margin = 30
+
+        x1 = max(0, x - margin)
+        y1 = max(0, y - margin)
+        x2 = min(crop.shape[1], x + w + margin)
+        y2 = min(crop.shape[0], y + h + margin)
+
+        return crop[y1:y2, x1:x2]
+
+    def _yolo_predict(self, image: np.ndarray) -> Tuple[str, float]:
+        results = self.yolo_model.predict(
+            image,
+            imgsz=224,
+            verbose=False,
+        )
+
+        probs = results[0].probs
+        class_id = int(probs.top1)
+        confidence = float(probs.top1conf)
+        label = results[0].names[class_id]
+
+        return label, confidence
+
+    def _detect_greek_letter(self, frame: np.ndarray) -> Tuple[str, float, str]:
+        if self.yolo_model is None:
+            return "vision_unavailable", 0.0, "YOLO model not loaded"
+
+        if frame is None:
+            return "vision_unavailable", 0.0, "No frame"
+
+        if VISION_USE_WHITE_CROP:
+            page_crop, _bbox, _mask = self._crop_white_page(frame)
+        else:
+            page_crop = frame
+
+        if page_crop is None:
+            detail = "AWW — no white page found"
+            self._log(f"[Vision] {detail}")
+            return "no_white_page", 0.0, detail
+
+        has_ink, ink_ratio, ink_mask = self._has_black_ink(page_crop)
+
+        if not has_ink:
+            detail = (
+                f"AWW — white page found but not enough ink "
+                f"(ink_ratio={ink_ratio:.4f})"
+            )
+            self._log(f"[Vision] {detail}")
+            return "no_ink", 0.0, detail
+
+        image_for_model = self._extract_ink_roi(page_crop, ink_mask)
+
+        try:
+            label, confidence = self._yolo_predict(image_for_model)
+        except Exception as e:
+            detail = f"YOLO predict error: {e}"
+            self._log(f"[Vision] {detail}")
+            return "vision_unavailable", 0.0, detail
+
+        if confidence < VISION_CONFIDENCE_THR:
+            detail = (
+                f"AWW — unsure: label={label}, "
+                f"confidence={confidence:.2f}, "
+                f"ink_ratio={ink_ratio:.4f}"
+            )
+            self._log(f"[Vision] {detail}")
+            return "low_confidence", confidence, detail
+
+        if label == "not_letter":
+            detail = (
+                f"AWW — not a letter "
+                f"(confidence={confidence:.2f}, ink_ratio={ink_ratio:.4f})"
+            )
+            self._log(f"[Vision] {detail}")
+            return "not_letter", confidence, detail
+
+        detail = (
+            f"GREAT — Greek letter found: {label}, "
+            f"confidence={confidence:.2f}, "
+            f"ink_ratio={ink_ratio:.4f}"
+        )
+
+        self._log(f"[Vision] {detail}")
+
+        return label, confidence, detail
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ROS callbacks
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def odom_callback(self, msg: Odometry) -> None:
+        self.odom_x = msg.pose.pose.position.x
+        self.odom_y = msg.pose.pose.position.y
+
+        q = msg.pose.pose.orientation
+
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+
+        self.odom_yaw = math.atan2(siny, cosy)
+
+        if not self.odom_ready:
+            self.odom_ready = True
+
+            self._log(
+                f"Fused pose ready from {self.pose_topic}: "
+                f"({self.odom_x:.2f}, {self.odom_y:.2f}) "
+                f"yaw={math.degrees(self.odom_yaw):.1f} deg"
+            )
+
+    def lidar_callback(self, msg: LaserScan) -> None:
+        self.latest_scan = msg
+
+        if not self.lidar_ready:
+            self.lidar_ready = True
+
+            self._log(
+                f"LiDAR ready: {len(msg.ranges)} rays "
+                f"[{msg.range_min:.2f}, {msg.range_max:.2f}] m"
+            )
+
+        half = math.radians(SAFETY_CONE_DEG / 2.0)
+        hit = False
+
+        for i, r in enumerate(msg.ranges):
+            a = msg.angle_min + i * msg.angle_increment
+
+            if abs(a) > half:
+                continue
+
+            if not math.isfinite(r):
+                continue
+
+            if r < CHASSIS_MIN_M:
+                continue
+
+            if r < SAFETY_STOP_M:
+                hit = True
+                break
+
+        self.safety_obstacle = hit
+
+    def joy_callback(self, msg: Joy) -> None:
+        self.last_joy = msg
+
+        if self._btn_down(msg, self.btn_circle):
+            with self._lock:
+                self.mode = self.MODE_MANUAL
+                self.auto_phase = self.PHASE_IDLE
+                self.auto_thread_started = False
+
+            self._stop()
+
+            m = String()
+            m.data = self.MODE_MANUAL
+            self.mode_pub.publish(m)
+
+            self._log("-> MANUAL (Circle)")
+
+        if self._btn_down(msg, self.btn_x):
+            with self._lock:
+                if self.auto_phase == self.PHASE_RUNNING:
+                    self._log("AUTO already running — ignoring X")
+                    return
+
+                self.mode = self.MODE_AUTO
+                self.auto_phase = self.PHASE_WAITING
+                self.auto_start_time = time.time()
+                self.auto_thread_started = False
+
+            m = String()
+            m.data = self.MODE_AUTO
+            self.mode_pub.publish(m)
+
+            self._log(f"-> AUTO in {STARTUP_DELAY_S:.0f} s...")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Timer control loop
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def control_loop(self) -> None:
+        if self.last_joy is None:
+            self._send_cmd()
+            return
+
+        joy = self.last_joy
+
+        if self.mode == self.MODE_MANUAL:
+            if not self._axis_pressed(joy, self.axis_l2):
+                self._send_cmd()
+                return
+
+            lin = self._apply_deadzone(
+                joy.axes[self.axis_right_y]
+                if self.axis_right_y < len(joy.axes)
+                else 0.0
+            )
+
+            ang = self._apply_deadzone(
+                joy.axes[self.axis_left_x]
+                if self.axis_left_x < len(joy.axes)
+                else 0.0
+            )
+
+            self._send_cmd(
+                MANUAL_LINEAR_SPEED * lin,
+                MANUAL_ANGULAR_SPEED * ang,
+            )
+
+            return
+
+        if self.mode == self.MODE_AUTO:
+            with self._lock:
+                phase = self.auto_phase
+                started = self.auto_thread_started
+
+            if phase == self.PHASE_WAITING:
+                if (time.time() - self.auto_start_time) < STARTUP_DELAY_S:
+                    return
+
+                if not self.odom_ready or not self.lidar_ready:
+                    self._log(f"Waiting for fused pose ({self.pose_topic})/lidar...")
+                    return
+
+                if started:
+                    return
+
+                self._set_mission_home()
+
+                self.visited_positions.clear()
+                self.logged_target_positions.clear()
+                self.waypoint_counts.clear()
+                self.photo_count = 0
+                self.event_count = 0
+
+                with self._lock:
+                    self.auto_phase = self.PHASE_RUNNING
+                    self.auto_thread_started = True
+
+                threading.Thread(
+                    target=self._run_mission,
+                    daemon=True,
+                ).start()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Main mission
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _run_mission(self) -> None:
+        self._log("== 360 SCAN + 7.5 m RAY-SWEEP MISSION START ==")
+
+        self._log(
+            f"  Field: {AREA_SIZE} x {AREA_SIZE} m | "
+            f"Outward sweep: {OUTWARD_SWEEP_M:.2f} m | "
+            f"Cone: ±{DETECT_CONE_DEG / 2:.0f} deg"
+        )
+
+        accum_rad = 0.0
+        prev_yaw = self.odom_yaw
+        ray_count = 0
+
+        while accum_rad < 2.0 * math.pi:
+            with self._lock:
+                if self.mode == self.MODE_MANUAL:
+                    self._stop()
+                    self._log("Mission aborted — MANUAL")
+                    return
+
+            detection = self._object_directly_ahead()
+
+            if detection is not None:
+                rng, wx, wy = detection
+
+                if self._already_logged_target(wx, wy):
+                    self._send_cmd(0.0, SCAN_TURN_SPEED)
+                    time.sleep(CONTROL_DT)
+
+                else:
+                    self._stop()
+
+                    ray_count += 1
+                    sweep_yaw = self.odom_yaw
+
+                    self._log(
+                        f"══ RAY SWEEP #{ray_count} START ══ "
+                        f"initial target range={rng:.2f} m | "
+                        f"yaw={math.degrees(sweep_yaw):.1f} deg"
+                    )
+
+                    # 1. Outward sweep, logging targets
+                    if not self._drive_sweep_leg(
+                        OUTWARD_SWEEP_M,
+                        sweep_yaw,
+                        log_new_targets=True,
+                    ):
+                        return
+
+                    self._stop()
+                    time.sleep(0.2)
+
+                    # 2. Turn 180 back toward centre
+                    if not self._turn_relative(180.0):
+                        return
+
+                    return_yaw = self.odom_yaw
+
+                    # 3. Return leg, avoid only, no photos/logs
+                    self._log(
+                        "Returning along same ray — obstacle avoidance only, no new logging"
+                    )
+
+                    if not self._drive_sweep_leg(
+                        OUTWARD_SWEEP_M,
+                        return_yaw,
+                        log_new_targets=False,
+                    ):
+                        return
+
+                    self._stop()
+                    time.sleep(0.2)
+
+                    # 4. Correct to exact home if needed
+                    home_dist = math.hypot(
+                        self.odom_x - self.home_x,
+                        self.odom_y - self.home_y,
+                    )
+
+                    if home_dist > RETURN_HOME_TOL_M:
+                        self._log(
+                            f"Home correction needed: {home_dist:.2f} m from centre"
+                        )
+
+                        dx = self.home_x - self.odom_x
+                        dy = self.home_y - self.odom_y
+                        home_yaw = math.atan2(dy, dx)
+
+                        if not self._turn_to_yaw(home_yaw):
+                            return
+
+                        if not self._drive_sweep_leg(
+                            home_dist,
+                            home_yaw,
+                            log_new_targets=False,
+                        ):
+                            return
+
+                    # 5. Face original outward scan direction again
+                    if not self._turn_to_yaw(sweep_yaw):
+                        return
+
+                    self._log(
+                        f"══ RAY SWEEP #{ray_count} COMPLETE — resuming 360 scan ══"
+                    )
+
+                    # Do not count the out/back turns as scan progress
+                    prev_yaw = self.odom_yaw
+                    time.sleep(0.3)
+                    continue
+
+            # Normal scan rotation
+            self._send_cmd(0.0, SCAN_TURN_SPEED)
+            time.sleep(CONTROL_DT)
+
+            curr_yaw = self.odom_yaw
+            delta = abs(self._norm_angle(curr_yaw - prev_yaw))
+            accum_rad += delta
+            prev_yaw = curr_yaw
+
+        self._stop()
+
+        self._log(
+            f"== 360 COMPLETE == "
+            f"{self.event_count} event(s) logged | "
+            f"Photos -> {FOR_ML_DIR}"
+        )
+
+        with self._lock:
+            self.auto_phase = self.PHASE_DONE
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        self._save_slam_map(f"bin_hunt_{ts}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Ray sweep leg
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _drive_sweep_leg(
+        self,
+        distance_m: float,
+        hold_yaw: float,
+        log_new_targets: bool,
+    ) -> bool:
+        """
+        Drive along a straight ray.
+
+        log_new_targets=True:
+            outward leg
+            detect/photo/classify/log/bypass/continue
+
+        log_new_targets=False:
+            return leg
+            avoid/bypass only
+        """
+
+        start_x = self.odom_x
+        start_y = self.odom_y
+
+        while True:
+            with self._lock:
+                if self.mode == self.MODE_MANUAL:
+                    self._stop()
+                    self._log("Sweep leg aborted — MANUAL")
+                    return False
+
+            dx = self.odom_x - start_x
+            dy = self.odom_y - start_y
+
+            progress = (
+                dx * math.cos(hold_yaw)
+                + dy * math.sin(hold_yaw)
+            )
+
+            remaining = distance_m - progress
+
+            if remaining <= 0.03:
+                self._stop()
+                self._log(f"Sweep leg complete: {distance_m:.2f} m")
+                return True
+
+            detection = self._object_directly_ahead()
+
+            if detection is not None:
+                rng, wx, wy = detection
+
+                self._stop()
+
+                approach_dist = max(0.0, rng - TARGET_STANDOFF_M)
+
+                if approach_dist > 0.05:
+                    self._log(
+                        f"  Target ahead at {rng:.2f} m. "
+                        f"Approaching {approach_dist:.2f} m to standoff..."
+                    )
+
+                    if not self._drive(approach_dist, forward=True):
+                        return False
+
+                detection2 = self._object_directly_ahead()
+
+                if detection2 is not None:
+                    rng2, wx2, wy2 = detection2
+                else:
+                    rng2, wx2, wy2 = rng, wx, wy
+
+                if log_new_targets and not self._already_logged_target(wx2, wy2):
+                    self._log(
+                        f"  New outward target found at range={rng2:.2f} m | "
+                        f"heading={math.degrees(hold_yaw):.1f} deg"
+                    )
+
+                    if not self._handle_target_photo_and_log(
+                        rng2,
+                        wx2,
+                        wy2,
+                        hold_yaw,
+                    ):
+                        return False
+
+                else:
+                    if log_new_targets:
+                        self._log(
+                            "  Target already logged — bypassing without duplicate CSV row"
+                        )
+                    else:
+                        self._log(
+                            "  Return leg obstacle — bypassing without photo/log"
+                        )
+
+                if not self._bypass_logged_target(hold_yaw):
+                    return False
+
+                continue
+
+            # Normal heading-hold drive
+            yaw_err = self._norm_angle(hold_yaw - self.odom_yaw)
+            ang = max(-0.6, min(0.6, 2.0 * yaw_err))
+
+            self._send_cmd(AUTO_SPEED, ang)
+            time.sleep(CONTROL_DT)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Detection helpers
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _object_directly_ahead(self) -> Optional[Tuple[float, float, float]]:
+        """
+        Find nearest LiDAR return inside forward cone and field boundary.
+
+        Returns:
+            range_m, world_x, world_y
+        """
+
+        scan = self.latest_scan
+
+        if scan is None:
+            return None
+
+        half_cone = math.radians(DETECT_CONE_DEG / 2.0)
+
+        best_r = float("inf")
+        best_wx = 0.0
+        best_wy = 0.0
+
+        for i, r in enumerate(scan.ranges):
+            a = scan.angle_min + i * scan.angle_increment
+
+            if abs(a) > half_cone:
+                continue
+
+            if not math.isfinite(r):
+                continue
+
+            if r < CHASSIS_MIN_M or r > MAX_DETECT_RANGE:
+                continue
+
+            if r >= best_r:
+                continue
+
+            world_bearing = self._norm_angle(self.odom_yaw + a)
+
+            wx = self.odom_x + r * math.cos(world_bearing)
+            wy = self.odom_y + r * math.sin(world_bearing)
+
+            fx, fy = self._world_to_field(wx, wy)
+
+            if abs(fx) > FIELD_HALF or abs(fy) > FIELD_HALF:
+                continue
+
+            best_r = r
+            best_wx = wx
+            best_wy = wy
+
+        if best_r == float("inf"):
+            return None
+
+        return best_r, best_wx, best_wy
+
+    def _already_logged_target(self, wx: float, wy: float) -> bool:
+        return any(
+            math.hypot(wx - px, wy - py) <= TARGET_LOG_RADIUS_M
+            for px, py in self.logged_target_positions
+        )
+
+    # Kept for compatibility with older code naming
+    def _already_visited(self, wx: float, wy: float) -> bool:
+        return self._already_logged_target(wx, wy)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Logging target result
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _make_waypoint_display_label(self, greek_letter: str) -> str:
+        key = greek_letter.strip().lower()
+
+        self.waypoint_counts[key] = self.waypoint_counts.get(key, 0) + 1
+        count = self.waypoint_counts[key]
+
+        base = key.capitalize()
+
+        if count == 1:
+            return base
+
+        return f"{base}{count}"
+
+    def _handle_target_photo_and_log(
+        self,
+        target_range: float,
+        wx: float,
+        wy: float,
+        heading_yaw: float,
+    ) -> bool:
+        """
+        Capture photo, classify as WAYPOINT or OBJECT, and log to CSV.
+        """
+
+        self.event_count += 1
+        event_id = self.event_count
+
+        self._log(f"  Capturing target #{event_id} photo and processing...")
+
+        photo_name, frame = self._capture_frame_and_save(event_id)
+
+        colour_class, _colour_score, colour_detail = self._detect_red_yellow_object(frame)
+
+        greek_letter = "not_checked"
+        letter_conf = 0.0
+        vision_detail = colour_detail
+
+        if colour_class in ("red", "yellow"):
+            record_type = "OBJECT"
+            display_label = f"OBJECT_{colour_class.upper()}"
+            greek_letter = "none"
+            letter_conf = 0.0
+            vision_detail = colour_detail
+
+        else:
+            greek_letter, letter_conf, greek_detail = self._detect_greek_letter(frame)
+            vision_detail = greek_detail
+
+            valid_waypoint = (
+                greek_letter not in (
+                    "vision_unavailable",
+                    "no_white_page",
+                    "no_ink",
+                    "low_confidence",
+                    "not_letter",
+                )
+                and letter_conf >= VISION_CONFIDENCE_THR
+            )
+
+            if valid_waypoint:
+                record_type = "WAYPOINT"
+                display_label = self._make_waypoint_display_label(greek_letter)
+            else:
+                record_type = "OBJECT"
+                display_label = "OBJECT_UNKNOWN"
+
+        fx, fy = self._world_to_field(wx, wy)
+        heading_deg = math.degrees(heading_yaw)
+
+        try:
+            with open(BIN_CSV_PATH, "a", newline="") as f:
+                csv.writer(f).writerow([
+                    event_id,
+                    time.strftime("%Y-%m-%dT%H:%M:%S"),
+
+                    record_type,
+                    display_label,
+
+                    f"{wx:.4f}",
+                    f"{wy:.4f}",
+                    f"{fx:.4f}",
+                    f"{fy:.4f}",
+
+                    f"{target_range:.3f}",
+                    f"{heading_deg:.1f}",
+
+                    photo_name,
+
+                    greek_letter,
+                    f"{letter_conf:.3f}",
+                    colour_class,
+                    vision_detail,
+                ])
+
+        except Exception as e:
+            self._log(f"WARNING: CSV write failed: {e}")
+
+        self.logged_target_positions.append((wx, wy))
+
+        self._log(
+            f"  Logged #{event_id}: {record_type} {display_label} | "
+            f"field=({fx:.2f}, {fy:.2f}) | "
+            f"letter={greek_letter} ({letter_conf:.0%}) | "
+            f"colour={colour_class} | "
+            f"photo={photo_name or 'NONE'}"
+        )
+
+        return True
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Camera
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _get_frame(self) -> Optional[np.ndarray]:
+        if not self.camera_ready or self.q_rgb is None:
+            return None
+
+        try:
+            pkt = self.q_rgb.tryGet()
+            return pkt.getCvFrame() if pkt else None
+        except Exception:
+            return None
+
+    def _capture_frame_and_save(self, visit_id: int) -> Tuple[str, Optional[np.ndarray]]:
+        """
+        Grab a frame from the OAK-D camera.
+
+        Saves to FOR_ML_DIR and publishes to Foxglove topic.
+
+        Returns:
+            filename, frame
+        """
+
+        with self._camera_lock:
+            if not self.camera_ready:
+                self._log("Camera not ready — skipping photo")
+                return "", None
+
+            frame = None
+            deadline = time.time() + 1.5
+
+            while time.time() < deadline:
+                frame = self._get_frame()
+
+                if frame is not None:
+                    break
+
+                time.sleep(0.05)
+
+            if frame is None:
+                self._log("No camera frame available")
+                return "", None
+
+            img_msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
+            img_msg.header.stamp = self.get_clock().now().to_msg()
+            self.image_pub.publish(img_msg)
+
+            self.photo_count += 1
+
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            name = f"target_{visit_id:03d}_{ts}.jpg"
+            path = os.path.join(FOR_ML_DIR, name)
+
+            try:
+                if cv2.imwrite(path, frame):
+                    self._log(f"  Photo -> {path}")
+                else:
+                    self._log(f"  WARNING: imwrite failed for {path}")
+                    name = ""
+
+            except Exception as e:
+                self._log(f"  Photo save error: {e}")
+                name = ""
+
+            return name, frame
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Motion primitives
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _drive(self, dist_m: float, forward: bool) -> bool:
+        """
+        Drive forward/reverse for dist_m.
+
+        This is a simple primitive used for approach and bypass pieces.
+
+        Returns False only if MANUAL abort happens.
+        """
+
+        if dist_m <= 0.01:
+            return True
+
+        start_x = self.odom_x
+        start_y = self.odom_y
+        hold_yaw = self.odom_yaw
+        sign = 1.0 if forward else -1.0
+
+        while True:
+            with self._lock:
+                if self.mode == self.MODE_MANUAL:
+                    self._stop()
+                    self._log("Drive aborted — MANUAL")
+                    return False
+
+            travelled = math.hypot(
+                self.odom_x - start_x,
+                self.odom_y - start_y,
+            )
+
+            if travelled >= dist_m - 0.01:
+                self._stop()
+                return True
+
+            if forward and self.safety_obstacle:
+                self._stop()
+                self._log("Safety stop — obstacle too close")
+                return True
+
+            yaw_err = self._norm_angle(hold_yaw - self.odom_yaw)
+
+            if forward:
+                ang = 2.0 * yaw_err
+            else:
+                ang = -2.0 * yaw_err
+
+            ang = max(-0.6, min(0.6, ang))
+
+            self._send_cmd(sign * AUTO_SPEED, ang)
+            time.sleep(CONTROL_DT)
+
+    def _turn_to_yaw(self, target_yaw: float) -> bool:
+        stable = 0
+
+        while True:
+            with self._lock:
+                if self.mode == self.MODE_MANUAL:
+                    self._stop()
+                    self._log("Turn aborted — MANUAL")
+                    return False
+
+            err = self._norm_angle(target_yaw - self.odom_yaw)
+
+            if abs(err) < ANGLE_TOL_RAD:
+                stable += 1
+
+                if stable >= 5:
+                    self._stop()
+                    return True
+
+            else:
+                stable = 0
+
+            raw = 1.8 * err
+            mag = min(TURN_SPEED_MAX, max(0.18, abs(raw)))
+
+            self._send_cmd(0.0, math.copysign(mag, raw))
+            time.sleep(CONTROL_DT)
+
+    def _turn_relative(self, degrees: float) -> bool:
+        target = self._norm_angle(self.odom_yaw + math.radians(degrees))
+        self._log(f"TURN {degrees:+.1f} deg")
+        return self._turn_to_yaw(target)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Bypass
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _choose_bypass_direction(self, hold_yaw: float) -> float:
+        """
+        Pick left/right bypass based on which side gives more field clearance.
+
+        Returns:
+            +90.0 for left
+            -90.0 for right
+        """
+
+        safe_lim = FIELD_HALF - 0.20
+
+        def projected_fy(sign: float) -> float:
+            nx = self.odom_x + sign * (-math.sin(hold_yaw)) * BYPASS_WIDTH_M
+            ny = self.odom_y + sign * (math.cos(hold_yaw)) * BYPASS_WIDTH_M
+            _fx, fy = self._world_to_field(nx, ny)
+            return fy
+
+        fy_left = projected_fy(+1.0)
+        fy_right = projected_fy(-1.0)
+
+        left_margin = safe_lim - abs(fy_left)
+        right_margin = safe_lim - abs(fy_right)
+
+        if left_margin >= right_margin:
+            self._log(
+                f"Bypass LEFT selected | "
+                f"fy_left={fy_left:.2f}, fy_right={fy_right:.2f}"
+            )
+            return +90.0
+
+        self._log(
+            f"Bypass RIGHT selected | "
+            f"fy_left={fy_left:.2f}, fy_right={fy_right:.2f}"
+        )
+
+        return -90.0
+
+    def _bypass_logged_target(self, hold_yaw: float) -> bool:
+        """
+        U-shaped bypass around current object/waypoint, then restores ray heading.
+        """
+
+        d = self._choose_bypass_direction(hold_yaw)
+        side = "LEFT" if d > 0 else "RIGHT"
+
+        self._log(f"BYPASS target -> {side}")
+
+        steps = [
+            (
+                lambda: self._turn_relative(d),
+                "turn sideways",
+            ),
+            (
+                lambda: self._drive(BYPASS_WIDTH_M, forward=True),
+                "move sideways",
+            ),
+            (
+                lambda: self._turn_relative(-d),
+                "face original direction",
+            ),
+            (
+                lambda: self._drive(BYPASS_FORWARD_M, forward=True),
+                "clear target",
+            ),
+            (
+                lambda: self._turn_relative(-d),
+                "turn back",
+            ),
+            (
+                lambda: self._drive(BYPASS_WIDTH_M, forward=True),
+                "return to ray line",
+            ),
+            (
+                lambda: self._turn_relative(d),
+                "restore ray heading",
+            ),
+        ]
+
+        for fn, label in steps:
+            self._log(f"  BYPASS: {label}")
+
+            if not fn():
+                return False
+
+        return self._turn_to_yaw(hold_yaw)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Map save
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _save_slam_map(self, stem: str) -> None:
+        if not SLAM_TOOLBOX_AVAILABLE or self.save_map_client is None:
+            self._log("slam_toolbox not available — map save skipped")
+            return
+
+        if not self.save_map_client.wait_for_service(timeout_sec=4.0):
+            self._log("WARNING: /slam_toolbox/save_map not responding")
+            return
+
+        req = SaveMap.Request()
+        map_stem = os.path.join(MAP_DIR, stem)
+
+        try:
+            req.name.data = map_stem
+        except AttributeError:
+            req.name = map_stem
+
+        future = self.save_map_client.call_async(req)
+
+        rclpy.spin_until_future_complete(
+            self,
+            future,
+            timeout_sec=15.0,
+        )
+
+        if future.done() and future.result() is not None:
+            self._log(f"Map saved: {map_stem}.pgm / .yaml")
+        else:
+            self._log("WARNING: map save timed out")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Utility
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _set_mission_home(self) -> None:
+        self.home_x = self.odom_x
+        self.home_y = self.odom_y
+        self.home_yaw = self.odom_yaw
+
+        self._log(
+            f"Home set: ({self.home_x:.2f}, {self.home_y:.2f}) "
+            f"yaw={math.degrees(self.home_yaw):.1f} deg"
+        )
+
+    def _world_to_field(self, wx: float, wy: float) -> Tuple[float, float]:
+        dx = wx - self.home_x
+        dy = wy - self.home_y
+
+        c = math.cos(self.home_yaw)
+        s = math.sin(self.home_yaw)
+
+        fx = c * dx + s * dy
+        fy = -s * dx + c * dy
+
+        return fx, fy
+
+    def _log(self, msg: str) -> None:
+        self.get_logger().info(msg)
+
+        s = String()
+        s.data = msg
+        self.status_pub.publish(s)
+
+    def _send_cmd(self, lin: float = 0.0, ang: float = 0.0) -> None:
+        t = Twist()
+        t.linear.x = float(lin)
+        t.angular.z = float(ang)
+        self.cmd_pub.publish(t)
+
+    def _stop(self) -> None:
+        self._send_cmd(0.0, 0.0)
+
+    @staticmethod
+    def _norm_angle(a: float) -> float:
+        return math.atan2(math.sin(a), math.cos(a))
+
+    def _apply_deadzone(self, v: float) -> float:
+        return 0.0 if abs(v) < self.deadzone else v
+
+    def _axis_pressed(self, joy: Joy, idx: int, threshold: float = 0.5) -> bool:
+        return len(joy.axes) > idx and joy.axes[idx] < threshold
+
+    def _btn_down(self, joy: Joy, idx: int) -> bool:
+        return len(joy.buttons) > idx and joy.buttons[idx] == 1
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Shutdown
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def destroy_node(self) -> None:
+        self._stop()
+
+        if self.pipeline is not None:
+            try:
+                self.pipeline.stop()
+            except Exception as e:
+                self.get_logger().warn(f"Camera stop error: {e}")
+
+        super().destroy_node()
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+
+    node = DualShockBinHunt()
+
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+
+    try:
+        executor.spin()
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        node._stop()
+        node.destroy_node()
+
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
