@@ -37,7 +37,7 @@ MAX_ANGULAR_SPEED = 0.6
 HEADING_KP = 1.2
 DISTANCE_KP = 0.6
 
-WAYPOINT_TOLERANCE_M = 0.5
+WAYPOINT_TOLERANCE_M = 1.0
 
 SETTLE_TIME_S = 3.0
 AUTO_START_DELAY_S = 5.0
@@ -450,10 +450,20 @@ class DualShockModeTeleop(Node):
 
             time.sleep(SETTLE_TIME_S)
 
-        self._log("All waypoints complete")
+        self._log("All waypoints complete — returning to origin (0, 0)")
+
+        reached_origin = self._seek_target(0.0, 0.0)
+
+        if reached_origin:
+            self._log("Returned to origin successfully")
+        else:
+            self._log("Return to origin interrupted")
+
+        self._log("Mission complete")
 
         with self._lock:
             self.mode = self.MODE_MANUAL
+            self._auto_started = False
 
     def joy_callback(self, msg: Joy):
 
@@ -472,8 +482,9 @@ class DualShockModeTeleop(Node):
 
             with self._lock:
 
-                if self.mode != self.MODE_AUTO:
+                if self.mode != self.MODE_AUTO and not self._auto_started:
 
+                    self._auto_started = True
                     self.mode = self.MODE_AUTO
 
                     threading.Thread(
@@ -481,7 +492,7 @@ class DualShockModeTeleop(Node):
                         daemon=True
                     ).start()
 
-            self._log("AUTO mode")
+                    self._log("AUTO mode triggered manually")
 
     def control_loop(self):
 
