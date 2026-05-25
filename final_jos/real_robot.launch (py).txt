@@ -1,0 +1,155 @@
+from launch import LaunchDescription
+from launch.actions import TimerAction, ExecuteProcess
+from launch_ros.actions import Node, ComposableNodeContainer, LoadComposableNodes
+from launch_ros.descriptions import ComposableNode
+from datetime import datetime
+
+
+def generate_launch_description():
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bag_path  = f"/root/auto4508_ws/rosbags/mission_{timestamp}"
+
+    return LaunchDescription([
+
+        # ── Robot driver ──────────────────────────────────────────────────────
+        Node(
+            package='ariaNode',
+            executable='ariaNode',
+            name='ariaNode',
+            output='screen',
+            arguments=['-rp', '/dev/ttyUSB0'],
+        ),
+
+        # ── Lakibeam LiDAR ────────────────────────────────────────────────────
+        Node(
+            package='lakibeam1',
+            executable='lakibeam1_scan_node',
+            name='lakibeam_lidar',
+            output='screen',
+            parameters=[{
+                'frame_id':         'laser',
+                'output_topic':     'scan',
+                'sensorip':         '192.168.198.2',
+                'hostip':           '0.0.0.0',
+                'port':             '2368',
+                'inverted':         False,
+                'angle_offset':     0,
+                'scanfreq':         '30',
+                'filter':           '3',
+                'laser_enable':     'true',
+                'scan_range_start': '0',
+                'scan_range_stop':  '360',
+            }],
+        ),
+
+        # ── IMU (Phidget Spatial) ─────────────────────────────────────────────
+        ComposableNodeContainer(
+            name='phidgets_container',
+            namespace='',
+            package='rclcpp_components',
+            executable='component_container',
+            composable_node_descriptions=[],
+            output='screen',
+        ),
+
+        LoadComposableNodes(
+            target_container='phidgets_container',
+            composable_node_descriptions=[
+                ComposableNode(
+                    package='phidgets_spatial',
+                    plugin='phidgets::SpatialRosI',
+                    name='phidgets_spatial',
+                    parameters=[
+                        '/root/auto4508_ws/src/project1/config/phidget_imu.yaml'
+                    ],
+                ),
+            ],
+        ),
+
+        # ── Gamepad ───────────────────────────────────────────────────────────
+        Node(
+            package='joy',
+            executable='joy_node',
+            name='joy_node',
+            output='screen',
+            parameters=[{'dev': '/dev/input/js0'}],
+        ),
+
+        # ── Foxglove visualisation ────────────────────────────────────────────
+        Node(
+            package='foxglove_bridge',
+            executable='foxglove_bridge',
+            name='foxglove_bridge',
+            output='screen',
+            parameters=[{
+                'port':    8765,
+                'address': '0.0.0.0',
+            }],
+        ),
+
+        # ── Static transforms ─────────────────────────────────────────────────
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='base_link_to_laser',
+            output='screen',
+            arguments=['0', '0', '0.2', '0', '0', '0', 'base_link', 'laser'],
+        ),
+
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='base_link_to_imu',
+            output='screen',
+            arguments=['0', '0', '0.1', '0', '0', '0', 'base_link', 'imu_link'],
+        ),
+
+        # ── EKF (odom + IMU -> /odom_fused) ──────────────────────────────────
+        Node(
+            package='robot_localization',
+            executable='ekf_node',
+            name='ekf_filter_node',
+            output='screen',
+            parameters=[
+                '/root/auto4508_ws/src/project1/config/ekf.yaml',
+                {'use_sim_time': False},   # IMPORTANT: must be False on real robot
+            ],
+            remappings=[('odometry/filtered', '/odom_fused')],
+        ),
+
+        # ── Rosbag — starts after 4 s so all topics are live ─────────────────
+        TimerAction(
+            period=4.0,
+            actions=[
+                ExecuteProcess(
+                    cmd=[
+                        'ros2', 'bag', 'record',
+                        '-o', bag_path,
+                        '/scan',
+                        '/odom_fused',
+                        '/cmd_vel',
+                        '/joy',
+                        '/tf',
+                        '/tf_static',
+                        '/imu/data',
+                        '/robot_status',
+                    ],
+                    output='screen',
+                ),
+            ],
+        ),
+
+        # ── Teleop — starts after 5 s (after EKF and bag are ready) ──────────
+        TimerAction(
+            period=5.0,
+            actions=[
+                Node(
+                    package='project1',
+                    executable='dual_shock_mode_teleop.py',
+                    name='dualshock_mode_teleop',
+                    output='screen',
+                ),
+            ],
+        ),
+    ])
